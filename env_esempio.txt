@@ -1,0 +1,11 @@
+# Copia queste righe in un file .env accanto a main.py (oppure imposta le variabili d'ambiente).
+# Per Gmail: attiva la verifica in due passaggi e crea una "Password per le app" (16 caratteri).
+# NON usare la password normale dell'account.
+MAIL_ADDRESS=LA TUA EMAIL
+MAIL_PASSWORD=LA PASSWORD APP
+MAIL_FROM_NAME= IL TUO NOME
+
+# Solo per provider diversi da Gmail/iCloud/Yahoo:
+# MAIL_IMAP_HOST=imap.tuoprovider.it
+# MAIL_SMTP_HOST=smtp.tuoprovider.it
+# MAIL_SMTP_PORT=465
