@@ -10,7 +10,7 @@ Il sistema integra modelli di intelligenza artificiale locali via Ollama, sintes
 
 Se desideri utilizzare subito Jarvis senza installare Python o configurare l'ambiente di sviluppo, puoi scaricare l'eseguibile Standalone già compilato per Windows:
 
-1. **Scarica il file:** Vai alla pagina della [Release V1.1.0 su GitHub](https://github.com/capofusnez/J.A.R.V.I.S/releases/tag/V1.1.0) e scarica il file `Jarvis.exe` dagli *Assets*.
+1. **Scarica il file:** Vai alla pagina della [Release V1.1.0](https://github.com/capofusnez/J.A.R.V.I.S/releases/tag/V1.1.0) e scarica il file `Jarvis.exe` dagli *Assets*.
 2. **Configura i servizi opzionali (Opzionale):** Crea o inserisci un file `.env` nella stessa cartella dell'eseguibile se vuoi abilitare le funzionalità email.
 3. **Avvia l'applicazione:** Fai doppio click su `Jarvis.exe`.
 
