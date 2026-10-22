@@ -1,0 +1,14 @@
+PyQt6
+qtawesome
+requests
+numpy
+sounddevice
+faster-whisper
+SpeechRecognition
+ddgs
+pyttsx3
+pywin32
+psutil
+pycaw
+comtypes
+python-dotenv
