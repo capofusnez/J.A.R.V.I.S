@@ -1,0 +1,30 @@
+# --- Script di automazione Git locali ---
+*.bat
+
+# --- File di configurazione locali / segreti ---
+.env
+*.log
+
+# --- Cache Python e file temporanei ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# --- Cartelle di build PyInstaller / Distribuzione ---
+build/
+dist/
+*.manifest
+*.spec
+
+# --- Cartelle ambienti virtuali ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- File temporanei di VS Code e del sistema ---
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
