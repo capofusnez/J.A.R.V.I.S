@@ -118,7 +118,7 @@ def _chain(first, rest):
 class LocalBrain:
     MAX_HISTORY = 10
 
-    def __init__(self, model_name="qwen2.5"):
+    def __init__(self, model_name="qwen2.5-coder:14b"):
         self.model_name = model_name
         self.url = "http://localhost:11434/api/chat"
         base = os.path.dirname(__file__)
