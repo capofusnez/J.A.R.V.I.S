@@ -1,0 +1,6 @@
+{
+  "modules": {
+    "retrytools": false,
+    "temperatureconverter": false
+  }
+}

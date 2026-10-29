@@ -12,3 +12,10 @@ psutil
 pycaw
 comtypes
 python-dotenv
+edge-tts
+miniaudio
+kokoro-onnx          # voci offline nicola/sara (consigliato)
+espeakng-loader      # necessario a kokoro-onnx su Windows
+# piper-tts   <- facoltativo: altre voci offline (paola, riccardo)
+pillow               # screenshot
+send2trash           # cancellare file spostandoli nel cestino

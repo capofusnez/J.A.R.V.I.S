@@ -11,12 +11,13 @@ from PyQt6.QtWidgets import QApplication, QSplashScreen, QLabel, QVBoxLayout, QM
 from PyQt6.QtGui import QFont, QColor, QPainter, QPen
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 
-# Importa la tua GUI cinematografica
-from gui_v2 import StarkHUD
+# Interfaccia in stile film. Per tornare alla precedente: from gui_v2 import StarkHUD
+from gui_jarvis import JarvisHUD as StarkHUD
+from modules.paths import LOGS_DIR
 from modules.brain import LocalBrain
 from modules.ollama_setup import OllamaSetup
 
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis.log")
+LOG_PATH = os.path.join(LOGS_DIR, "jarvis.log")
 
 
 def setup_logging():
@@ -36,7 +37,7 @@ def install_excepthook():
                 box = QMessageBox()
                 box.setIcon(QMessageBox.Icon.Critical)
                 box.setWindowTitle("Errore in Jarvis")
-                box.setText(f"Si è verificato un errore: {exc}\n\nI dettagli sono in jarvis.log")
+                box.setText(f"Si è verificato un errore: {exc}\n\nI dettagli sono in logs/jarvis.log")
                 box.setDetailedText(text)
                 box.exec()
         except Exception:
@@ -295,7 +296,7 @@ if __name__ == "__main__":
     setup_logging()
     install_excepthook()
     # errori nativi (crash di Qt, segfault) finiscono in jarvis_crash.log invece di sparire
-    _crash_file = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_crash.log"),
+    _crash_file = open(os.path.join(LOGS_DIR, "jarvis_crash.log"),
                        "a", encoding="utf-8")
     faulthandler.enable(_crash_file)
     atexit.register(lambda: logging.info("Il processo sta terminando"))
@@ -330,7 +331,7 @@ if __name__ == "__main__":
         except Exception:
             logging.exception("Impossibile aprire la GUI principale")
             QMessageBox.critical(None, "Errore in Jarvis",
-                                 "Impossibile aprire l'interfaccia. I dettagli sono in jarvis.log")
+                                 "Impossibile aprire l'interfaccia. I dettagli sono in logs/jarvis.log")
             app.quit()
 
     worker.finished_signal.connect(on_ready)

@@ -32,6 +32,7 @@ class Listener:
         self.max_seconds = max_seconds
 
         self.threshold = 400.0
+        self.level = 0.0                 # 0..1: volume del microfono, letto dall'interfaccia
         self.model = None
         self.device = None
         self.recognizer = sr.Recognizer()
@@ -97,7 +98,9 @@ class Listener:
                             dtype="int16", blocksize=self.block) as stream:
             while True:
                 chunk, _ = stream.read(self.block)
-                loud = self._rms(chunk) > self.threshold
+                rms = self._rms(chunk)
+                self.level = min(1.0, rms / max(1.0, self.threshold * 4.0))
+                loud = rms > self.threshold
 
                 if not speaking:
                     preroll.append(chunk.copy())
@@ -153,6 +156,7 @@ class Listener:
         try:
             self._ensure_ready()
             samples = self._record_phrase()
+            self.level = 0.0
             if samples is None or len(samples) < self.samplerate * 0.4:
                 return ""
             text = self._transcribe(samples).strip()

@@ -355,7 +355,7 @@ class StarkHUD(QMainWindow):
         
         if name_to_set and len(name_to_set) > 1:
             self.user_label = name_to_set
-            self.append_chat("JARVIS", f"Identificazione completata. Utente riconosciuto: {self.user_label}. Benvenuto, Signore.")
+            self.append_chat("JARVIS", f"Identificazione completata. Utente riconosciuto: {self.user_label}. Piacere di conoscerti!")
 
     def init_animations(self):
         self.core_rotation_timer = QTimer(self)
@@ -484,7 +484,7 @@ class StarkHUD(QMainWindow):
             self.append_chat("USER", spoken_text)
             self.process_command(spoken_text)
         else:
-            self.append_chat("JARVIS", "Nessun input vocale registrato, Signore.")
+            self.append_chat("JARVIS", "Nessun input vocale registrato. Riprova pure.")
 
     def send_message(self):
         text = self.entry.text().strip()

@@ -15,7 +15,9 @@ from email.utils import parseaddr, formataddr, formatdate, make_msgid, getaddres
 
 try:                                  # opzionale: legge MAIL_* da un file .env
     from dotenv import load_dotenv
-    load_dotenv()
+    from modules.paths import ENV_PATH
+    load_dotenv(ENV_PATH)             # il .env sta accanto a Jarvis.exe (o a main.py)
+    load_dotenv()                     # ripiego: cartella corrente
 except Exception:
     pass
 

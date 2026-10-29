@@ -4,6 +4,14 @@ import importlib
 import pkgutil
 import inspect
 import sys
+import importlib.util
+
+try:
+    from modules.paths import TOOLS_DIR, CONFIG_PATH
+except Exception:                                    # uso fuori dal progetto
+    TOOLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "moduli")
+    CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "config.json")
+
 
 class ModuleManager:
     """Engine per la scoperta automatica (Auto-Discovery) e la gestione a caldo dei moduli."""
@@ -17,10 +25,8 @@ class ModuleManager:
     def _load_config(self) -> dict:
         """Legge il file config.json nella root o lo genera con i default se manca."""
         try:
-            root_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-            config_path = os.path.join(root_dir, "config.json")
-            if os.path.exists(config_path):
-                with open(config_path, "r", encoding="utf-8") as f:
+            if os.path.exists(CONFIG_PATH):          # config.json accanto a Jarvis.exe (modificabile da te)
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     return json.load(f)
         except Exception:
             pass
@@ -47,6 +53,37 @@ class ModuleManager:
                         self.module_registry[short_key] = (import_path, name)
             except Exception as e:
                 print(f"[Auto-Discovery Error] Impossibile caricare {module_name}: {e}")
+        self._discover_external()
+
+    @staticmethod
+    def _import_file(path: str):
+        """Importa un modulo da un file qualsiasi (i moduli installati stanno fuori dall'exe, nella cartella 'moduli')."""
+        name = "jarvis_ext_" + os.path.splitext(os.path.basename(path))[0]
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _discover_external(self):
+        """Moduli nella cartella 'moduli' accanto a Jarvis.exe. Quelli integrati hanno la precedenza sul nome."""
+        if not os.path.isdir(TOOLS_DIR):
+            return
+        for fname in sorted(os.listdir(TOOLS_DIR)):
+            if not fname.endswith(".py") or fname.startswith("_"):
+                continue
+            short_key = fname[:-3].replace("_tools", "").lower()
+            known = self.module_registry.get(short_key)
+            if known and not str(known[0]).startswith("file:"):
+                continue
+            path = os.path.join(TOOLS_DIR, fname)
+            try:
+                mod = self._import_file(path)
+                for name, obj in inspect.getmembers(mod, inspect.isclass):
+                    if obj.__module__ == mod.__name__ and not name.startswith("_"):
+                        self.module_registry[short_key] = ("file:" + path, name)
+            except Exception as e:
+                print(f"[Auto-Discovery Error] Impossibile caricare {fname}: {e}")
 
     def load_all_modules(self):
         """Carica a caldo tutti i moduli scoperti che sono abilitati in config.json."""
@@ -68,7 +105,9 @@ class ModuleManager:
 
         import_path, class_name = self.module_registry[mod_key]
         try:
-            if import_path in sys.modules:
+            if str(import_path).startswith("file:"):
+                mod = self._import_file(import_path[5:])             # sempre riletto da disco: vale anche per "ricarica"
+            elif import_path in sys.modules:
                 mod = importlib.reload(sys.modules[import_path])
             else:
                 mod = importlib.import_module(import_path)
