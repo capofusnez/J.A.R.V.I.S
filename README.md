@@ -131,7 +131,7 @@ Ingranaggio in alto a destra, oppure **F9**.
 - **POSTA / ACCOUNT** — più account (Gmail, iCloud, Yahoo…): indirizzo, password per le app, nome; «Prova accesso».
   Le password stanno in `data\accounts.json`.
 - **VOCI** — le persone riconosciute, «dimentica la voce», «ascolta solo il proprietario».
-- **AGGIORNAMENTI** — versione, «Controlla ora», «Scarica e installa», controllo automatico.
+
 
 ## Modelli
 
