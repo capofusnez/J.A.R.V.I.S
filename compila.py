@@ -11,12 +11,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(HERE)
 SEP = os.pathsep                       # ";" su Windows
 
-HIDDEN = ["qtawesome", "PyQt6", "requests", "psutil", "pyttsx3", "speech_recognition", "sounddevice", "numpy",
+HIDDEN = ["settings_dialog", "neural_map", "qtawesome", "PyQt6", "requests", "psutil", "pyttsx3", "speech_recognition", "sounddevice", "numpy",
           "dotenv", "ddgs", "win32com.client", "pythoncom", "win32gui", "win32con", "win32clipboard", "pycaw",
           "comtypes", "edge_tts", "miniaudio", "PIL", "send2trash",
           # librerie standard che i moduli creati da Jarvis possono usare
           "base64", "calendar", "decimal", "fractions", "hashlib", "secrets", "statistics", "textwrap",
-          "unicodedata", "uuid"]
+          "unicodedata", "uuid", "collections", "datetime", "functools", "itertools", "math", "operator",
+          "random", "string", "typing", "json", "re"]
 COLLECT_ALL = ["faster_whisper", "ctranslate2", "qtawesome", "kokoro_onnx", "espeakng_loader", "onnxruntime"]
 
 

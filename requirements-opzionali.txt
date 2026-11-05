@@ -1,0 +1,6 @@
+# Riconoscimento delle voci (facoltativo, serve anche alle voci Kokoro): onnxruntime
+# Voci offline (facoltative): avvia.bat prova a installarle una per una e va avanti anche se una non si installa.
+onnxruntime
+kokoro-onnx
+espeakng-loader
+# piper-tts

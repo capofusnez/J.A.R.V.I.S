@@ -14,7 +14,10 @@ Se la cartella dell'exe non è scrivibile (es. C:\\Program Files) si usa %LOCALA
 """
 import os
 import sys
+import re
 import shutil
+import codecs
+import logging
 
 FROZEN = bool(getattr(sys, "frozen", False))
 BUNDLE_DIR = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -85,3 +88,78 @@ def init_dirs():
 
 
 init_dirs()
+
+
+# ----------------------------------------------------------------------------- file .env (posta)
+def _decode_env(raw: bytes) -> str:
+    """Legge il file qualunque codifica abbia salvato l'editor: UTF-8 (anche con BOM), UTF-16, Windows-1252."""
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
+def parse_env(text: str) -> dict:
+    out = {}
+    for line in text.splitlines():
+        line = line.strip().lstrip("\ufeff")
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if val[:1] in ("\"", "'") and val.find(val[0], 1) > 0:
+            val = val[1:val.find(val[0], 1)]            # valore tra virgolette: ignora il commento dopo
+        else:
+            val = re.split(r"\s+#", val, maxsplit=1)[0].strip()
+        if key:
+            out[key] = val
+    return out
+
+
+# ".env.txt": Windows nasconde le estensioni e Blocco note spesso aggiunge .txt senza dirlo
+ENV_CANDIDATES = [ENV_PATH, ENV_PATH + ".txt", os.path.join(os.getcwd(), ".env")]
+ENV_FOUND = ""          # percorso del .env effettivamente letto
+EARLY_LOG = []          # messaggi prima che il log su file sia pronto (main.py li scrive in jarvis.log)
+
+
+def load_env() -> str:
+    """Carica il .env accanto a Jarvis (le chiavi del file hanno la precedenza). Ritorna il percorso letto o ''."""
+    global ENV_FOUND
+    for path in ENV_CANDIDATES:
+        if os.path.isfile(path):
+            try:
+                with open(path, "rb") as f:
+                    values = parse_env(_decode_env(f.read()))
+            except OSError as e:
+                EARLY_LOG.append((logging.WARNING, "[POSTA] non riesco a leggere %s: %s" % (path, e)))
+                continue
+            for k, v in values.items():
+                if v:
+                    os.environ[k] = v
+            ENV_FOUND = path
+            EARLY_LOG.append((logging.INFO, "[POSTA] letto %s (chiavi: %s)" % (path, ", ".join(sorted(values)) or "nessuna")))
+            return path
+    return ""
+
+
+def env_problem() -> str:
+    """Perche' la posta non e' configurata, in una frase che si puo' anche dire a voce ('' = tutto a posto)."""
+    if not os.environ.get("MAIL_ADDRESS") and not os.environ.get("MAIL_PASSWORD"):
+        if not ENV_FOUND:
+            for odd in (".env.txt", "env", "env.txt", ".env.example", "env_example.txt.txt"):
+                if os.path.isfile(os.path.join(APP_DIR, odd)) and odd not in ("env_example.txt",):
+                    return f"trovo un file chiamato {odd} ma deve chiamarsi esattamente punto env"
+            return "non trovo il file punto env nella cartella di Jarvis"
+        return "il file punto env c'è ma è vuoto o scritto in un formato che non riconosco"
+    if not os.environ.get("MAIL_ADDRESS"):
+        return "nel file punto env manca la riga MAIL_ADDRESS"
+    if not os.environ.get("MAIL_PASSWORD"):
+        return "nel file punto env manca la riga MAIL_PASSWORD"
+    return ""
+
+
+load_env()

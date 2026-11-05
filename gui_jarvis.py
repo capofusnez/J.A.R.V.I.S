@@ -7,6 +7,8 @@ nome utente, avvisi posta, memoria.
 
 Per usarla: in main.py   from gui_jarvis import JarvisHUD as StarkHUD
 """
+import os
+import re
 import sys
 import time
 import math
@@ -21,13 +23,16 @@ import requests
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QTextEdit, QLineEdit, QPushButton, QSizeGrip, QFrame)
-from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QThread, QObject, pyqtSignal
 from PyQt6.QtGui import (QFont, QColor, QPainter, QPen, QBrush, QRadialGradient, QLinearGradient,
                          QTextCursor, QFontMetricsF)
 
 from modules.brain import LocalBrain
+from modules import updater
+from modules.version import VERSION
 from modules.speaker import Speaker
 from modules.listener import Listener
+from neural_map import NeuralMap
 
 # ----------------------------------------------------------------------------- palette
 CYAN = (0, 229, 255)
@@ -86,6 +91,8 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: trans
 QToolTip { background: #06202e; color: #cdf8ff; border: 1px solid #00e5ff; }
 """
 
+MUTE_STYLE = ("QPushButton { background: rgba(255, 72, 72, 70); color: #ff6b6b; "
+              "border: 1px solid #ff4848; padding: 9px 18px; font-weight: bold; }")
 AUTO_ON_STYLE = ("QPushButton { background: rgba(64, 255, 214, 60); color: #40ffd6; "
                  "border: 1px solid #40ffd6; padding: 9px 18px; font-weight: bold; }"
                  "QPushButton:hover { background: rgba(64, 255, 214, 100); color: #ffffff; }")
@@ -493,11 +500,12 @@ class TopBar(QWidget):
         self.operator_label.setStyleSheet(f"color: {DIM_HEX};")
         lay.addWidget(self.operator_label)
 
+        self.settings_btn = self._wbtn("⚙", "Impostazioni: modelli, posta, voci (F9)", window.open_settings)
         self.pin_btn = self._wbtn("PIN", "Tieni sempre in primo piano", window.toggle_on_top)
         self.min_btn = self._wbtn("–", "Riduci a icona", window.showMinimized)
         self.max_btn = self._wbtn("□", "Schermo intero (F11)", window.toggle_fullscreen)
         self.close_btn = self._wbtn("✕", "Chiudi", window.close, name="closebtn")
-        for b in (self.pin_btn, self.min_btn, self.max_btn, self.close_btn):
+        for b in (self.settings_btn, self.pin_btn, self.min_btn, self.max_btn, self.close_btn):
             lay.addWidget(b)
         self.setFixedHeight(52)
 
@@ -523,6 +531,30 @@ class TopBar(QWidget):
 
 
 # ----------------------------------------------------------------------------- worker (come prima)
+class _LogBridge(QObject):
+    line = pyqtSignal(str, str)                   # (livello, testo)
+
+
+class _GuiLogHandler(logging.Handler):
+    """Inoltra i log di Jarvis (moduli, Ollama, errori) al pannello ELABORAZIONE DATI."""
+    def __init__(self, bridge):
+        super().__init__(level=logging.INFO)
+        self.bridge = bridge
+
+    def emit(self, record):
+        try:
+            msg = record.getMessage()
+            if record.exc_info:
+                msg += " · " + str(record.exc_info[1])
+            name = record.name.split(".")[-1]
+            if name in ("root", ""):
+                self.bridge.line.emit(record.levelname, msg[:300])
+            elif record.levelno >= logging.WARNING or record.name.startswith(("jarvis", "modules")):
+                self.bridge.line.emit(record.levelname, f"{name}: {msg}"[:300])
+        except Exception:
+            pass
+
+
 class BrainWorker(QThread):
     sentence = pyqtSignal(str)
     completed = pyqtSignal()
@@ -542,16 +574,49 @@ class BrainWorker(QThread):
         self.completed.emit()
 
 
+WAKE_RE = re.compile(r"\b(?:j|g|gi|y|ch|d?j)[aeè]r?v[iey]s{1,2}e?\b", re.I)   # jarvis, giarvis, jervis, garvis...
+WAKE_WAIT_S = float(os.environ.get("JARVIS_WAKE_WAIT", "10"))      # dopo il nome: quanto aspetta che tu parli
+REPLY_WAIT_S = float(os.environ.get("JARVIS_REPLY_WAIT", "14"))    # dopo una sua domanda: quanto aspetta la risposta
+
+
+def split_wake(text: str):
+    """(trovato, comando): 'ehi Jarvis che ore sono' -> (True, 'che ore sono'); 'Jarvis' -> (True, '')."""
+    m = WAKE_RE.search(text)
+    if not m:
+        return False, text.strip()
+    after = text[m.end():].strip(" ,.;:!?-–")
+    before = text[:m.start()].strip(" ,.;:!?-–")
+    before = re.sub(r"^(?:ehi|ehy|hey|ok|okay|ciao|scusa|senti)\b[ ,]*", "", before, flags=re.I).strip()
+    return True, (after or before)
+
+
 class ListenerWorker(QThread):
     finished = pyqtSignal(str)
     speech_detected = pyqtSignal(str)
+    awake_changed = pyqtSignal(bool)        # True = ti ha sentito chiamare e aspetta che parli
 
-    def __init__(self, listener, continuous=False):
+    def __init__(self, listener, continuous=False, wake=True):
         super().__init__()
         self.listener = listener
         self.continuous = continuous
+        self.wake = wake and continuous      # in modalità continua serve il nome "Jarvis"
         self._is_running = True
         self._paused = False
+        self.awake = not self.wake           # senza parola di chiamata è sempre "sveglio"
+        self._awake_until = 0.0
+
+    def wake_up(self, seconds: float):
+        """Microfono aperto per `seconds` senza bisogno di richiamarlo (es. dopo una sua domanda)."""
+        if self.wake:
+            self._awake_until = time.time() + seconds
+            if not self.awake:
+                self.awake = True
+                self.awake_changed.emit(True)
+
+    def go_to_sleep(self):
+        if self.wake and self.awake:
+            self.awake = False
+            self.awake_changed.emit(False)
 
     @property
     def is_paused(self) -> bool:
@@ -562,7 +627,16 @@ class ListenerWorker(QThread):
             if self._paused:
                 time.sleep(0.5)
                 continue
+            wait = None
+            if self.wake and self.awake:
+                left = self._awake_until - time.time()
+                if left <= 0:
+                    self.go_to_sleep()                      # nessuno parla più: serve richiamarlo col nome
+                    continue
+                wait = min(left, 6.0)
             try:
+                spoken_text = self.listener.listen(start_timeout=wait)
+            except TypeError:
                 spoken_text = self.listener.listen()
             except Exception:
                 spoken_text = ""
@@ -581,6 +655,23 @@ class ListenerWorker(QThread):
                     self.finished.emit("")
                     break
                 continue
+
+            if self.wake:
+                found, command = split_wake(spoken_text)
+                if not self.awake:
+                    if not found:
+                        continue                            # in attesa del nome: ignora tutto il resto
+                    if not command:                         # solo "Jarvis": si sveglia e aspetta che parli
+                        self.wake_up(WAKE_WAIT_S)
+                        continue
+                    spoken_text = command
+                elif found and command:
+                    spoken_text = command                   # "Jarvis, ..." detto a conversazione aperta
+                elif found:                                 # solo il nome mentre è già in ascolto
+                    self._awake_until = time.time() + WAKE_WAIT_S
+                    continue
+                self.awake = False                          # il GUI lo riapre se lui fa una domanda
+                self.awake_changed.emit(False)
 
             if self.continuous:
                 self._paused = True
@@ -605,15 +696,21 @@ class JarvisHUD(QMainWindow):
     mail_alert = pyqtSignal(str)
     learned = pyqtSignal(str)
     ollama_status = pyqtSignal(bool)
+    brain_event = pyqtSignal(str, str)           # cosa sta facendo il cervello (ascolto, modello, strumento...)
+    update_found = pyqtSignal(object)            # c'è una nuova versione su GitHub
+    update_msg = pyqtSignal(str)                 # messaggio sugli aggiornamenti (chat + voce)
+    update_progress = pyqtSignal(float)          # avanzamento dello scaricamento (0..1)
+    update_done = pyqtSignal(str)                # 'restart' | 'reload'
+    neural_snapshot = pyqtSignal(object)         # stato reale dei collegamenti (moduli, modelli, servizi)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("J.A.R.V.I.S.")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
-        self.setMinimumSize(1020, 700)
+        self.setMinimumSize(1180, 720)
         self.setStyleSheet(STYLE)
         screen = QApplication.primaryScreen().geometry()
-        w, h = min(1320, screen.width() - 80), min(820, screen.height() - 80)
+        w, h = min(1500, screen.width() - 80), min(880, screen.height() - 80)
         self.setGeometry((screen.width() - w) // 2, (screen.height() - h) // 2, w, h)
 
         self.user_label = "TU"
@@ -622,7 +719,9 @@ class JarvisHUD(QMainWindow):
         self.listener = Listener()
         threading.Thread(target=self.listener.warmup, daemon=True).start()
 
+        self._last_reply = ""
         self.is_continuous_active = False
+        self.muted = False
         self.continuous_worker = None
         self.listener_worker = None
         self.worker = None
@@ -645,11 +744,31 @@ class JarvisHUD(QMainWindow):
         self.mail_alert.connect(self.on_mail_alert)
         self.learned.connect(self.on_learned)
         self.ollama_status.connect(self._on_ollama_status)
+        self.brain_event.connect(self._on_brain_event)
+        self._update_info = None
+        self._updating = False
+        self._notified_version = ""
+        self.update_found.connect(self._on_update_found)
+        self.update_msg.connect(self._on_update_msg)
+        self.update_progress.connect(self._on_update_progress)
+        self.update_done.connect(self._on_update_done)
+        threading.Thread(target=self._update_watch, daemon=True).start()
+        self._log_bridge = _LogBridge()
+        self._log_bridge.line.connect(self._on_log_line)
+        self._log_handler = _GuiLogHandler(self._log_bridge)
+        logging.getLogger().addHandler(self._log_handler)
+        self._t_req = 0.0
+        self._t_first = 0.0
+        self.proc_log("SISTEMA", "pannello attivo · F10 lo nasconde")
+        self.neural_snapshot.connect(self.core.set_snapshot)
+        self.brain.on_event = self.brain_event.emit
         self.brain.on_learned = self.learned.emit
         if self.brain.start_mail_watcher(self.mail_alert.emit):
             self.log_event("MAIL WATCH: ATTIVO")
 
         threading.Thread(target=self._ollama_watch, daemon=True).start()
+        threading.Thread(target=self._neural_watch, daemon=True).start()
+        QTimer.singleShot(1200, self._autostart_listening)
 
         self.ui_timer = QTimer(self)
         self.ui_timer.timeout.connect(self._tick)
@@ -678,7 +797,7 @@ class JarvisHUD(QMainWindow):
         root.addLayout(mid, 1)
 
         # colonna sinistra: sistema + registro eventi
-        left_w = QWidget()
+        left_w = self.left_w = QWidget()
         left_w.setFixedWidth(316)
         left = QVBoxLayout(left_w)
         left.setContentsMargins(0, 0, 0, 0)
@@ -721,12 +840,12 @@ class JarvisHUD(QMainWindow):
         left.addWidget(self.event_panel, 3)
         mid.addWidget(left_w)
 
-        # centro: nucleo
-        self.core = ArcCore()
+        # centro: mappa neurale (collegamenti reali di Jarvis)
+        self.core = NeuralMap()
         mid.addWidget(self.core, 1)
 
         # colonna destra: canale di comunicazione
-        right_w = QWidget()
+        right_w = self.right_w = QWidget()
         right_w.setMinimumWidth(350)
         right_w.setMaximumWidth(440)
         right = QVBoxLayout(right_w)
@@ -737,7 +856,17 @@ class JarvisHUD(QMainWindow):
         self.chat_box.setFrameShape(QFrame.Shape.NoFrame)
         self.chat_box.setFont(make_font(10, mono=True))
         self.comm_panel.body.addWidget(self.chat_box)
-        right.addWidget(self.comm_panel)
+        right.setSpacing(14)
+        right.addWidget(self.comm_panel, 6)
+
+        self.proc_panel = HudPanel("ELABORAZIONE DATI")
+        self.proc_box = QTextEdit()
+        self.proc_box.setReadOnly(True)
+        self.proc_box.setFrameShape(QFrame.Shape.NoFrame)
+        self.proc_box.setFont(make_font(8, mono=True))
+        self.proc_box.document().setMaximumBlockCount(500)
+        self.proc_panel.body.addWidget(self.proc_box)
+        right.addWidget(self.proc_panel, 4)
         mid.addWidget(right_w)
 
         # barra di input
@@ -748,17 +877,15 @@ class JarvisHUD(QMainWindow):
         self.entry.setFont(make_font(11, mono=True))
         self.entry.returnPressed.connect(self.send_message)
         row.addWidget(self.entry, 1)
-        self.auto_btn = QPushButton("AUTO")
-        self.auto_btn.setToolTip("Ascolto continuo")
-        self.mic_btn = QPushButton("PARLA")
-        self.mic_btn.setToolTip("Ascolto singolo")
+        self.mute_btn = QPushButton("MIC ●")
+        self.mute_btn.setToolTip("Jarvis ascolta sempre e aspetta la parola «Jarvis». Premi per silenziare il microfono (F8)")
         self.send_btn = QPushButton("INVIA")
-        for b in (self.auto_btn, self.mic_btn, self.send_btn):
+        for b in (self.mute_btn, self.send_btn):
             b.setFont(make_font(9.5, bold=True, mono=True))
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             row.addWidget(b)
-        self.auto_btn.clicked.connect(self.toggle_continuous_listening)
-        self.mic_btn.clicked.connect(self.start_listening)
+        self.mute_btn.setStyleSheet(AUTO_ON_STYLE)
+        self.mute_btn.clicked.connect(self.toggle_mute)
         self.send_btn.clicked.connect(self.send_message)
         grip = QSizeGrip(self)
         grip.setFixedSize(18, 18)
@@ -793,9 +920,37 @@ class JarvisHUD(QMainWindow):
         self.topbar.pin_btn.setStyleSheet(f"color: {CYAN_HEX};" if on_top else "")
         self.log_event("PRIMO PIANO: " + ("ON" if on_top else "OFF"))
 
+    def open_settings(self):
+        """Pagina Impostazioni: modelli Ollama, account di posta, voci riconosciute."""
+        try:
+            from settings_dialog import SettingsDialog
+            dlg = getattr(self, "_settings", None)
+            if dlg is None:
+                dlg = self._settings = SettingsDialog(self.brain, self)
+            else:
+                dlg.reload_models()
+                dlg._fill_accounts()
+                dlg._fill_voices()
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception as e:
+            logging.exception("[IMPOSTAZIONI] non riesco ad aprire la pagina")
+            self.log_event("IMPOSTAZIONI: ERRORE (vedi logs/jarvis.log)")
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_F11:
             self.toggle_fullscreen()
+        elif event.key() == Qt.Key.Key_F8:
+            self.toggle_mute()
+        elif event.key() == Qt.Key.Key_F10:
+            self.proc_panel.setVisible(not self.proc_panel.isVisible())
+        elif event.key() == Qt.Key.Key_F9:
+            self.open_settings()
+        elif event.key() == Qt.Key.Key_F2:                       # modalità mappa: nasconde i pannelli laterali
+            show = not self.left_w.isVisible()
+            self.left_w.setVisible(show)
+            self.right_w.setVisible(show)
         elif event.key() == Qt.Key.Key_Escape and self.isFullScreen():
             self.showNormal()
         else:
@@ -803,10 +958,25 @@ class JarvisHUD(QMainWindow):
 
     def closeEvent(self, event):
         self._running = False
+        try:
+            logging.getLogger().removeHandler(self._log_handler)
+        except Exception:
+            pass
         if getattr(self.brain, "watcher", None):
             self.brain.watcher.stop()
         if self.continuous_worker:
             self.continuous_worker.stop()
+        dlg = getattr(self, "_settings", None)
+        if dlg is not None:
+            dlg._cancel_pull = True                        # scaricamenti di modelli avviati dalle Impostazioni
+            try:
+                dlg.close()
+            except Exception:
+                pass
+        try:
+            self.speaker.stop()
+        except Exception:
+            pass
         super().closeEvent(event)
 
     # ------------------------------------------------------------------ stato e animazione
@@ -820,7 +990,7 @@ class JarvisHUD(QMainWindow):
         if self._brain_busy:
             return "thinking"
         lw = self.continuous_worker
-        if self.is_continuous_active and lw is not None and not lw.is_paused:
+        if self.is_continuous_active and lw is not None and not lw.is_paused and lw.awake:
             return "listening"
         if self._manual_listening:
             return "listening"
@@ -902,13 +1072,27 @@ class JarvisHUD(QMainWindow):
         except Exception:
             pass
         self.info_label.setText("<br>".join([
-            row("MODELLO ", self.brain.model_name),
+            self._model_row(row),
             row("OLLAMA  ", "ONLINE" if self.ollama_ok else "OFFLINE", CYAN_HEX if self.ollama_ok else "#ff4848"),
             row("VOCE    ", str(getattr(self.speaker, "voice_key", "-")).upper()),
             row("RETE    ", f"↓ {fmt_rate(down)}  ↑ {fmt_rate(up)}"),
             row("POSTA   ", mail),
             row("MEMORIA ", f"{facts} FATTI"),
         ]))
+
+    @staticmethod
+    def _short_model(name: str) -> str:
+        base, _, var = name.partition(":")
+        return base.upper() + ("" if var.lower() in ("", "latest") else " " + var.upper())
+
+    def _model_row(self, row) -> str:
+        """Riga MODELLO: quello che sta ragionando adesso (in ambra) oppure il modello base."""
+        base = self.brain.model_name
+        active = getattr(self, "_active_model", "")
+        if active and time.time() < getattr(self, "_model_until", 0.0):
+            tag = "BASE" if active == base else "POTENTE"
+            return row("MODELLO ", f"▶ {self._short_model(active)} · {tag}", AMBER_HEX)
+        return row("MODELLO ", f"{self._short_model(base)} · BASE")
 
     def _ollama_watch(self):
         while self._running:
@@ -922,6 +1106,40 @@ class JarvisHUD(QMainWindow):
                     return
                 time.sleep(0.5)
 
+    def _neural_watch(self):
+        """Ogni 2 secondi legge lo stato reale dei moduli e lo passa alla mappa (così un modulo nuovo compare da solo)."""
+        while self._running:
+            try:
+                self.neural_snapshot.emit(self.brain.neural_snapshot())
+            except Exception:
+                logging.exception("Mappa neurale: lettura dei moduli non riuscita")
+            for _ in range(4):
+                if not self._running:
+                    return
+                time.sleep(0.5)
+
+    def _on_brain_event(self, kind: str, name: str):
+        self.core.on_event(kind, name)
+        if kind == "model" and name:
+            self.proc_log("MODELLO", f"{name} · " + ("base" if name == self.brain.model_name else "potente"))
+        elif kind == "tool" and name:
+            self.proc_log("STRUMENTO", name)
+        elif kind == "service" and name:
+            self.proc_log("SERVIZIO", name)
+        elif kind == "think":
+            self.proc_log("PENSIERO", "elaboro la richiesta…")
+        if kind == "tool" and name:
+            self.log_event("STRUMENTO: " + name.upper())
+        elif kind == "service" and name:
+            self.log_event("SERVIZIO: " + name.upper())
+        elif kind == "model" and name:
+            self._active_model, self._model_until = name, time.time() + 6.0
+            base = self.brain.model_name
+            self.log_event(("MODELLO BASE: " if name == base else "MODELLO POTENTE: ") + self._short_model(name))
+            self._update_stats()
+        elif kind == "done":
+            self._model_until = min(getattr(self, "_model_until", 0.0), time.time() + 1.5)
+
     def _on_ollama_status(self, ok: bool):
         if ok != self.ollama_ok:
             self.log_event("OLLAMA ONLINE" if ok else "OLLAMA OFFLINE")
@@ -929,6 +1147,27 @@ class JarvisHUD(QMainWindow):
         label = self.topbar.status_label
         label.setText(spaced("LINK NEURALE STABILE" if ok else "LINK NEURALE INTERROTTO"))
         label.setStyleSheet(f"color: {DIM_HEX};" if ok else "color: #ff4848;")
+
+    PROC_COLORS = {"INPUT": "#ffffff", "ASCOLTO": "#7fdfff", "MODELLO": "#ffb020", "STRUMENTO": "#a6ff7f",
+                   "SERVIZIO": "#a6ff7f", "OUTPUT": "#00e5ff", "TEMPO": "#9aa7b4", "LOG": "#6f8797",
+                   "ERRORE": "#ff4848", "AVVISO": "#ffb020", "SISTEMA": "#6f8797", "PENSIERO": "#c9a6ff"}
+
+    def proc_log(self, tag: str, text: str):
+        """Una riga nel pannello ELABORAZIONE DATI: ora · TAG · testo."""
+        try:
+            c = self.PROC_COLORS.get(tag, DIM_HEX)
+            self.proc_box.append(
+                f"<span style='color:{DIM_HEX};'>{time.strftime('%H:%M:%S')}</span> "
+                f"<b style='color:{c};'>{html.escape(tag)}</b> "
+                f"<span style='color:{ICE_HEX};'>{html.escape(text)}</span>")
+            sb = self.proc_box.verticalScrollBar()
+            sb.setValue(sb.maximum())
+        except Exception:
+            pass
+
+    def _on_log_line(self, level: str, text: str):
+        tag = "ERRORE" if level in ("ERROR", "CRITICAL") else "AVVISO" if level == "WARNING" else "LOG"
+        self.proc_log(tag, text)
 
     def log_event(self, text: str):
         self.events.append((time.strftime("%H:%M:%S"), text))
@@ -986,16 +1225,165 @@ class JarvisHUD(QMainWindow):
         self._scroll_chat()
 
     # ------------------------------------------------------------------ flusso conversazione
+    def _speaker_label(self) -> str:
+        """Chi ha parlato (dalla voce): 'USER' per il proprietario o se non si riconoscono voci, altrimenti il nome."""
+        sp = getattr(self.listener, "last_speaker", None)
+        vid = getattr(self.listener, "voiceid", None)
+        if not sp or vid is None or not vid.names():
+            return "USER (VOICE)"
+        if sp.get("name"):
+            return "USER (VOICE)" if sp["name"] == vid.owner else sp["name"]
+        return "OSPITE"
+
+    def _is_guest_voice(self) -> bool:
+        return self._speaker_label() not in ("USER (VOICE)",)
+
+    def _set_speaker(self, voice: bool):
+        """Dice al cervello chi sta parlando: la voce riconosciuta, oppure None se hai scritto tu (sei il proprietario)."""
+        sp = getattr(self.listener, "last_speaker", None) if voice else None
+        self.brain.current_speaker = sp
+        if sp and sp.get("name") and not sp.get("short"):
+            self.log_event("VOCE: " + str(sp["name"]).upper())
+
     def send_message(self):
         text = self.entry.text().strip()
         if not text:
             return
         self.entry.clear()
+        self._set_speaker(False)
         if self.is_continuous_active and self.continuous_worker:
             self.continuous_worker.pause()
         self.check_user_name(text)
         self.append_chat("USER", text)
         self.process_command(text)
+
+    # ------------------------------------------------------------------ aggiornamenti OTA (GitHub)
+    UPD_INSTALL_RE = re.compile(r"\b(?:installa|scarica|applica|esegui|fai|avvia)\b[^.?!]*\baggiornament\w*|\baggiornati\b", re.I)
+    UPD_CHECK_RE = re.compile(r"\b(?:controlla|cerca|verifica|c'?\s*è|ci sono|ci sarebbero)\b[^.?!]*\baggiornament\w*|"
+                              r"\baggiornament\w*\b[^.?!]*\b(?:disponibil\w*|nuov\w*)", re.I)
+    UPD_VER_RE = re.compile(r"\b(?:che|quale|qual è la)\s+versione\b|\bversione di jarvis\b", re.I)
+
+    def _say(self, text: str):
+        self.append_chat("JARVIS", text)
+        self.speaker.speak(text, block=False)
+        self._resume_listener_when_silent()
+
+    def _try_update_command(self, text: str) -> bool:
+        if getattr(self.brain, "pending", None):
+            return False
+        if self.UPD_INSTALL_RE.search(text):
+            if self.brain._is_guest():
+                self._say("L'aggiornamento posso installarlo solo su richiesta del proprietario.")
+            else:
+                self._say("Controllo se c'è una nuova versione.")
+                threading.Thread(target=self._check_and_install, daemon=True).start()
+            return True
+        if self.UPD_CHECK_RE.search(text):
+            self._say("Controllo su GitHub.")
+            threading.Thread(target=self._check_update, args=(True,), daemon=True).start()
+            return True
+        if self.UPD_VER_RE.search(text):
+            self._say(f"Sono la versione {VERSION}.")
+            return True
+        return False
+
+    def _check_update(self, announce: bool):
+        """Thread: chiede a GitHub l'ultima release. announce=True racconta anche 'sei aggiornato' e gli errori."""
+        info = updater.check()
+        if not info["ok"]:
+            if announce:
+                self.update_msg.emit(info["error"])
+            else:
+                logging.info("Controllo aggiornamenti: %s", info["error"])
+            return None
+        if info["available"]:
+            self._update_info = info
+            if announce or info["latest"] != self._notified_version:
+                self._notified_version = info["latest"]
+                self.update_found.emit(info)
+        elif announce:
+            self.update_msg.emit(f"Sei già aggiornato: versione {info['current']}.")
+        return info
+
+    def _check_and_install(self):
+        info = self._update_info if (self._update_info and self._update_info.get("available")) else self._check_update(False)
+        if not info or not info.get("ok"):
+            self.update_msg.emit((info or {}).get("error") or "Non riesco a controllare gli aggiornamenti: guarda in Impostazioni > AGGIORNAMENTI.")
+            return
+        if not info["available"]:
+            self.update_msg.emit(f"Sei già aggiornato: versione {info['current']}.")
+            return
+        self.run_install(info)
+
+    def run_install(self, info: dict):
+        """Scarica e prepara l'aggiornamento (da thread o dalla finestra Impostazioni)."""
+        if self._updating:
+            return
+        self._updating = True
+        self.update_msg.emit(f"Scarico la versione {info['latest']}…")
+        last = [-1]
+
+        def prog(f):
+            pct = int(f * 100)
+            if pct != last[0]:
+                last[0] = pct
+                self.update_progress.emit(f)
+
+        def work():
+            try:
+                result = updater.install(info, prog)
+                self.update_done.emit(result)
+            except Exception as e:
+                logging.exception("Aggiornamento fallito")
+                self.update_msg.emit(f"Aggiornamento non riuscito: {e}")
+            finally:
+                self._updating = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_watch(self):
+        for _ in range(20):                              # all'avvio aspetta qualche secondo, poi controlla ogni 6 ore
+            if not self._running:
+                return
+            time.sleep(0.5)
+        while self._running:
+            try:
+                cfg = updater.load_settings()
+                if cfg["auto_check"] and cfg["repo"] and not self._updating:
+                    self._check_update(False)
+            except Exception:
+                logging.exception("Controllo aggiornamenti")
+            for _ in range(6 * 3600 * 2):
+                if not self._running:
+                    return
+                time.sleep(0.5)
+
+    def _on_update_found(self, info):
+        notes = " ".join((info.get("notes") or "").split())[:240]
+        self.log_event("AGGIORNAMENTO: v" + info["latest"])
+        self.proc_log("SISTEMA", f"nuova versione {info['latest']} disponibile (tu hai {info['current']})")
+        msg = f"È disponibile la versione {info['latest']} (tu hai la {info['current']})."
+        if notes:
+            msg += f" Novità: {notes}"
+        msg += " Dì «installa l'aggiornamento» quando vuoi."
+        self.append_chat("JARVIS", msg)
+        self.speaker.speak(f"È disponibile la versione {info['latest']}. Dì «installa l'aggiornamento» quando vuoi.", block=False)
+
+    def _on_update_msg(self, text: str):
+        self.proc_log("SISTEMA", text)
+        self._say(text)
+
+    def _on_update_progress(self, f: float):
+        if int(f * 100) % 10 == 0:
+            self.proc_log("SISTEMA", f"aggiornamento: scaricato il {int(f * 100)}%")
+
+    def _on_update_done(self, result: str):
+        if result == "restart":
+            self.log_event("AGGIORNAMENTO: RIAVVIO")
+            self._say("Aggiornamento scaricato. Mi riavvio tra un attimo.")
+            QTimer.singleShot(3500, lambda: (self.close(), QApplication.quit()))
+        else:
+            self._say("Aggiornamento copiato. Riavvia Jarvis per usarlo.")
 
     def _try_voice_command(self, text: str) -> bool:
         """'cambia voce', 'usa la voce di Diego', 'elenco voci': li gestisce lo speaker, senza passare dal modello."""
@@ -1018,28 +1406,58 @@ class JarvisHUD(QMainWindow):
     def process_command(self, user_text: str):
         if self._try_voice_command(user_text):
             return
+        if self._try_update_command(user_text):
+            return
         self._brain_busy = True
         self._reply_started = False
+        self._last_reply = ""
+        self._t_req, self._t_first = time.time(), 0.0
+        sp = getattr(self.brain, "current_speaker", None)
+        who = (sp.get("name") or "ospite") if isinstance(sp, dict) else ""
+        self.proc_log("INPUT", f"«{user_text}»" + (f" · voce: {who}" if who else "") + f" · {len(user_text.split())} parole")
         self.worker = BrainWorker(user_text, self.brain)
         self.worker.sentence.connect(self.on_brain_sentence)
         self.worker.completed.connect(self.on_brain_finished)
         self.worker.start()
 
     def on_brain_sentence(self, sentence: str):
+        if not self._t_first and self._t_req:
+            self._t_first = time.time()
+            self.proc_log("TEMPO", f"prima frase dopo {self._t_first - self._t_req:.1f}s")
+        self.proc_log("OUTPUT", sentence)
+        self._last_reply += " " + sentence
         self.append_chat_stream(sentence)
         self.speaker.speak(sentence, block=False)
 
     def on_brain_finished(self):
+        if self._t_req:
+            self.proc_log("TEMPO", f"risposta completa in {time.time() - self._t_req:.1f}s · "
+                                   f"{len((self._last_reply or '').split())} parole")
+            self._t_req = 0.0
         self._brain_busy = False
         if self._reply_started:
             self.chat_box.append("")
-        self._resume_listener_when_silent()
+        self._resume_listener_when_silent(self._expects_reply())
 
-    def _resume_listener_when_silent(self):
+    def _expects_reply(self) -> bool:
+        """Jarvis aspetta una risposta: una bozza/conferma in sospeso, oppure ha chiuso con una domanda."""
+        if getattr(self.brain, "pending", None):
+            return True
+        last = (self._last_reply or "").strip()
+        if not last:
+            return False
+        tail = re.split(r"(?<=[.!?])\s+", last)[-1]
+        return tail.endswith("?") or bool(re.search(
+            r"\b(?:dimmi|fammi sapere|vuoi che|desideri|come preferisci|quale preferisci|a chi)\b[^.!?]*$", tail, re.I))
+
+    def _resume_listener_when_silent(self, keep_open: bool = False):
         def resume_when_silent():
             self.speaker.wait_until_done()
-            if self.is_continuous_active and self.continuous_worker:
-                self.continuous_worker.resume()
+            lw = self.continuous_worker
+            if self.is_continuous_active and lw:
+                if keep_open:
+                    lw.wake_up(REPLY_WAIT_S)               # microfono aperto: risponde senza richiamarlo
+                lw.resume()
 
         threading.Thread(target=resume_when_silent, daemon=True).start()
 
@@ -1057,47 +1475,70 @@ class JarvisHUD(QMainWindow):
         self.log_event("MEMORIA AGGIORNATA")
 
     # ------------------------------------------------------------------ microfono
-    def toggle_continuous_listening(self):
-        if not self.is_continuous_active:
-            self.is_continuous_active = True
-            self.auto_btn.setText("AUTO ●")
-            self.auto_btn.setStyleSheet(AUTO_ON_STYLE)
-            self.continuous_worker = ListenerWorker(self.listener, continuous=True)
-            self.continuous_worker.speech_detected.connect(self.on_continuous_speech_detected)
-            self.continuous_worker.start()
-            self.log_event("ASCOLTO CONTINUO: ON")
-        else:
+    def _start_listening_loop(self):
+        old = self.continuous_worker
+        if old is not None and old.isRunning():
+            old.wait(1500)                                   # il vecchio ascolto deve aver lasciato il microfono
+        self.is_continuous_active = True
+        self.continuous_worker = ListenerWorker(self.listener, continuous=True)
+        self.continuous_worker.speech_detected.connect(self.on_continuous_speech_detected)
+        self.continuous_worker.awake_changed.connect(self.on_awake_changed)
+        self.continuous_worker.start()
+        self.log_event("IN ATTESA: DÌ «JARVIS»")
+        self.proc_log("ASCOLTO", "microfono attivo · in attesa della parola «Jarvis»")
+
+    def _autostart_listening(self):
+        """All'avvio Jarvis è già in ascolto: aspetta il suo nome, senza premere nulla."""
+        if os.environ.get("JARVIS_AUTOSTART", "1") == "0" or self.is_continuous_active or self.muted:
+            return
+        try:
+            self._start_listening_loop()
+        except Exception:
+            logging.exception("Impossibile avviare l'ascolto automatico")
+
+    def toggle_mute(self):
+        """Un solo pulsante: microfono attivo (sempre in ascolto) oppure muto (Jarvis a riposo)."""
+        if not self.muted:
+            self.muted = True
             self.is_continuous_active = False
-            self.auto_btn.setText("AUTO")
-            self.auto_btn.setStyleSheet("")
             if self.continuous_worker:
                 self.continuous_worker.stop()
-            self.log_event("ASCOLTO CONTINUO: OFF")
+            self.mute_btn.setText("MUTO")
+            self.mute_btn.setStyleSheet(MUTE_STYLE)
+            self.log_event("MICROFONO: MUTO · A RIPOSO")
+            self.proc_log("ASCOLTO", "microfono silenziato · Jarvis a riposo (puoi ancora scrivere)")
+        else:
+            self.muted = False
+            self.mute_btn.setText("MIC ●")
+            self.mute_btn.setStyleSheet(AUTO_ON_STYLE)
+            self._start_listening_loop()
+
+    def on_awake_changed(self, awake: bool):
+        self.log_event("TI ASCOLTO..." if awake else "IN ATTESA: DÌ «JARVIS»")
+        self.proc_log("ASCOLTO", "microfono aperto, ti ascolto" if awake else "in attesa della parola «Jarvis»")
+        if awake:
+            threading.Thread(target=self._beep, args=((880, 0.09), (1320, 0.09)), daemon=True).start()
+
+    @staticmethod
+    def _beep(*tones):
+        """Due note brevi: 'ti ascolto' (senza parlare sopra la tua voce)."""
+        try:
+            import numpy as _np, sounddevice as _sd
+            sr_ = 22050
+            wave = _np.concatenate([0.18 * _np.sin(2 * _np.pi * f * _np.arange(int(sr_ * d)) / sr_)
+                                    * _np.hanning(int(sr_ * d)) for f, d in tones])
+            _sd.play(wave.astype(_np.float32), sr_)
+            _sd.wait()
+        except Exception:
+            pass
 
     def on_continuous_speech_detected(self, spoken_text: str):
         if self.is_continuous_active:
-            self.check_user_name(spoken_text)
-            self.append_chat("USER", spoken_text)
+            self._set_speaker(True)
+            if not self._is_guest_voice():
+                self.check_user_name(spoken_text)           # "mi chiamo..." detto da un ospite non cambia l'operatore
+            self.append_chat(self._speaker_label(), spoken_text)
             self.process_command(spoken_text)
-
-    def start_listening(self):
-        self.mic_btn.setEnabled(False)
-        self.mic_btn.setText("ASCOLTO...")
-        self._manual_listening = True
-        self.listener_worker = ListenerWorker(self.listener, continuous=False)
-        self.listener_worker.finished.connect(self.on_listen_finished)
-        self.listener_worker.start()
-
-    def on_listen_finished(self, spoken_text: str):
-        self._manual_listening = False
-        self.mic_btn.setEnabled(True)
-        self.mic_btn.setText("PARLA")
-        if spoken_text and not spoken_text.startswith("Errore"):
-            self.check_user_name(spoken_text)
-            self.append_chat("USER", spoken_text)
-            self.process_command(spoken_text)
-        else:
-            self.append_chat("JARVIS", "Non ho sentito nulla. Riprova pure.")
 
 
 # Compatibilità con main.py esistente (from gui_v2 import StarkHUD)

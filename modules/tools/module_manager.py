@@ -5,6 +5,7 @@ import pkgutil
 import inspect
 import sys
 import importlib.util
+import logging
 
 try:
     from modules.paths import TOOLS_DIR, CONFIG_PATH
@@ -19,6 +20,8 @@ class ModuleManager:
     def __init__(self):
         self.loaded_modules = {}  # Nome modulo -> Istanza della classe
         self.module_registry = {} # Nome modulo -> (import_path, class_name)
+        self.load_errors = {}     # Nome modulo -> motivo per cui non si è agganciato
+        self.failed = set()       # moduli il cui file non si riesce nemmeno a importare
         self.config = self._load_config()
         self.discover_available_modules()
 
@@ -51,9 +54,19 @@ class ModuleManager:
                         # Ricava la chiave breve (es. "network_tools" o "network" -> "network")
                         short_key = module_name.replace("_tools", "").lower()
                         self.module_registry[short_key] = (import_path, name)
+                        self.failed.discard(short_key)
+                        self.load_errors.pop(short_key, None)
             except Exception as e:
-                print(f"[Auto-Discovery Error] Impossibile caricare {module_name}: {e}")
+                self._note_failure(module_name.replace("_tools", "").lower(), e)
         self._discover_external()
+
+    def _note_failure(self, key: str, e: Exception):
+        msg = f"{type(e).__name__}: {e}"
+        if self.load_errors.get(key) != msg:                 # una sola riga di log per errore, non a ogni scansione
+            logging.error("[MODULI] %s non si importa: %s", key, msg)
+            print(f"[Auto-Discovery Error] Impossibile caricare {key}: {msg}")
+        self.load_errors[key] = msg
+        self.failed.add(key)
 
     @staticmethod
     def _import_file(path: str):
@@ -62,7 +75,15 @@ class ModuleManager:
         spec = importlib.util.spec_from_file_location(name, path)
         mod = importlib.util.module_from_spec(spec)
         sys.modules[name] = mod
-        spec.loader.exec_module(mod)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                source = f.read()
+            if "from __future__ import annotations" not in source:      # evita NameError nelle annotazioni (es. -> NomeClasse)
+                source = "from __future__ import annotations\n" + source
+            exec(compile(source, path, "exec"), mod.__dict__)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
         return mod
 
     def _discover_external(self):
@@ -82,8 +103,10 @@ class ModuleManager:
                 for name, obj in inspect.getmembers(mod, inspect.isclass):
                     if obj.__module__ == mod.__name__ and not name.startswith("_"):
                         self.module_registry[short_key] = ("file:" + path, name)
+                        self.failed.discard(short_key)
+                        self.load_errors.pop(short_key, None)
             except Exception as e:
-                print(f"[Auto-Discovery Error] Impossibile caricare {fname}: {e}")
+                self._note_failure(short_key, e)
 
     def load_all_modules(self):
         """Carica a caldo tutti i moduli scoperti che sono abilitati in config.json."""
@@ -114,8 +137,11 @@ class ModuleManager:
 
             cls = getattr(mod, class_name)
             self.loaded_modules[mod_key] = cls()
+            self.load_errors.pop(mod_key, None)
             return f"Modulo '{mod_key}' agganciato con successo."
         except Exception as e:
+            self.load_errors[mod_key] = f"{type(e).__name__}: {e}"
+            logging.error("[MODULI] %s non si aggancia: %s", mod_key, self.load_errors[mod_key])
             return f"Errore nell'aggancio del modulo '{mod_key}': {e}"
 
     def unload_module(self, mod_key: str) -> str:

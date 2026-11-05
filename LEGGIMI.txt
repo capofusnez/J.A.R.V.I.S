@@ -1,112 +1,163 @@
-JARVIS - FILE CORRETTI
-======================
+JARVIS - GUIDA RAPIDA
+=====================
 
-Copia i file nelle stesse cartelle del tuo progetto (sovrascrivi quelli esistenti):
+COME SI AVVIA
+-------------
+1. Estrai tutto lo zip in una cartella (per esempio C:\Jarvis).
+2. Doppio clic su avvia.bat. La prima volta installa le librerie (qualche minuto), poi parte da solo.
+   Serve Python 3.11 o più recente. Se manca Ollama, Jarvis lo scarica e lo installa chiedendo il permesso.
+3. Modelli (se non li hai già):  ollama pull qwen2.5   e   ollama pull qwen2.5-coder:14b
+4. Posta (facoltativa): copia env_example.txt in un file chiamato .env e scrivi indirizzo e "password per le app".
+   Il file .env deve stare nella stessa cartella di avvia.bat / main.py (o di Jarvis.exe) e chiamarsi esattamente ".env"
+   (Windows nasconde le estensioni: se è ".env.txt" Jarvis lo legge lo stesso). Dopo averlo creato riavvia Jarvis.
+   Se la posta non parte, dì "ci sono email nuove?": Jarvis ti dice cosa manca. I dettagli sono in logs\jarvis.log.
 
-  main.py                      -> cartella principale (accanto a gui_v2.py)
-  gui_jarvis.py                -> cartella principale  (NUOVA interfaccia stile film; usata da main.py)
-  provavoce.py                 -> cartella principale  (NUOVO: fa ascoltare le voci e salva la scelta)
-  gui_v2.py                    -> cartella principale (è la TUA gui precedente, con soli 2 testi cambiati: via "Signore")
-  config.json                  -> cartella principale  (se ne hai già uno, aggiungi solo le due righe dei moduli)
-  requirements.txt             -> cartella principale  (poi: pip install -r requirements.txt)
-  env_example.txt              -> copia le righe in un file .env (solo se usi la posta)
+COSA VEDI
+---------
+Al centro c'è la MAPPA NEURALE: i collegamenti reali di Jarvis.
+  - catena della voce:  ASCOLTO > WHISPER > CERVELLO > VOCE > ALTOPARLANTE
+  - i due modelli (CHAT e CODER), MEMORIA, POSTA e RICERCA
+  - tutti i moduli-strumento attorno al cervello
+Quando fai una richiesta gli impulsi viaggiano lungo i collegamenti: si vede l'ascolto, la trascrizione, il cervello,
+il modello usato e lo strumento che Jarvis attiva. In basso le quattro fasi: ASCOLTO, TRASCRIZIONE, ELABORAZIONE, RISPOSTA.
+  linea piena        modulo collegato
+  linea rotta + X    modulo disattivato (config.json) o modello non installato
+  nodo vuoto giallo  modulo creato da Jarvis, in attesa del tuo "installa": non è ancora collegato
+  rombo giallo       modulo creato da Jarvis
+Se un modulo non si collega: passa il mouse sul nodo, se si carica con errore vedi il motivo (di solito manca una libreria:
+  pip install nome-libreria). Lo stesso motivo è in logs\jarvis.log alla riga [MODULI]. Un modulo con "false" in config.json
+  è spento di proposito: mettilo a true e riavvia. Un modulo in attesa si attiva dicendo "installa".
+Passa il mouse su un nodo per i dettagli. Tasti: F2 = solo mappa (nasconde i pannelli laterali), F11 = schermo intero.
 
-  modules/brain.py             -> modules/
-  modules/mail.py              -> modules/
-  modules/memory.py            -> modules/
-  modules/listener.py          -> modules/
-  modules/speaker.py           -> modules/   (AGGIORNATO: più voci)
-  modules/ollama_setup.py      -> modules/
-  modules/module_builder.py    -> modules/   (NUOVO)
-  modules/tools/__init__.py    -> modules/tools/
-  modules/tools/web_tools.py   -> modules/tools/
+DOVE JARVIS TIENE I FILE
+------------------------
+Tutto sta accanto a main.py (o a Jarvis.exe), in cartelle ordinate:
+  .env           password della posta (lo scrivi tu)
+  config.json    moduli attivi / disattivi
+  data\          memoria (memory.json), stato posta, voce scelta
+  logs\          jarvis.log e jarvis_crash.log: se qualcosa non va, guarda qui
+  voices\        voci offline scaricate
+  moduli\        moduli creati da Jarvis e installati; moduli\_pending = in attesa del tuo "installa"
+Se la cartella non è scrivibile (es. C:\Program Files) usa %LOCALAPPDATA%\Jarvis.
 
-Non vanno toccati gli altri file in modules/tools/ (audio_tools, system_tools, ecc.).
-I moduli "retrytools" e "temperatureconverter" sono disattivati da config.json; puoi anche cancellarli.
+ASCOLTO CON IL NOME
+-------------------
+Premi AUTO: Jarvis resta in attesa e ignora tutto finché non dici "Jarvis" (anche "ehi Jarvis, che ore sono": in quel caso risponde subito).
+Se dici solo "Jarvis" senti due note brevi e lui aspetta che parli (circa 10 secondi). Se non parli più, torna in attesa e devi richiamarlo.
+Se ti fa una domanda (o aspetta una conferma, per esempio per un'email) tiene il microfono aperto circa 14 secondi: rispondi senza richiamarlo.
+Tempi regolabili con le variabili JARVIS_WAKE_WAIT e JARVIS_REPLY_WAIT (secondi). Il tasto PARLA resta un ascolto singolo senza nome.
 
-NUOVA INTERFACCIA
------------------
-main.py ora usa gui_jarvis.py. Per tornare alla vecchia: in main.py cambia la riga
-  from gui_jarvis import JarvisHUD as StarkHUD   ->   from gui_v2 import StarkHUD
-Tasti: F11 schermo intero, doppio clic sulla barra in alto = massimizza, PIN = sempre in primo piano.
+RICONOSCERE LE VOCI
+-------------------
+Jarvis capisce chi sta parlando dalla voce, tutto in locale. Al primo avvio scarica un piccolo modello (circa 26 MB, una volta sola)
+in voices\speaker_model.onnx; serve la libreria onnxruntime (la installa avvia.bat). Le "impronte" (non l'audio) stanno in data\voiceprints.json.
+  "impara la mia voce, sono Andrea"     ti ascolta per quattro frasi e impara. Il primo che presenti è il proprietario.
+  "impara la voce di Marco"             poi fai parlare Marco normalmente per quattro frasi
+  "ora sta parlando Marco"          assegna a Marco le frasi appena sentite (dette da lui, prima del tuo comando)
+  "chi sta parlando" / "chi conosci"    dice chi riconosce; "dimentica la voce di Marco" la cancella
+  "rispondi solo a me" / "rispondi a tutti"   ignora le altre voci / le ascolta
+Una voce sconosciuta, dopo che l'ha chiamato, si sente chiedere come si chiama e viene imparata. Le voci note si affinano da sole
+a ogni frase. Gli altri possono chiacchierare con lui, ma spegnimento, cancellazioni, email, mouse/tastiera e moduli li accetta solo
+dal proprietario (scrivendo da tastiera sei sempre il proprietario; per disattivare il blocco: variabile JARVIS_VOICE_GATE=0).
+Se confonde le voci regola JARVIS_VOICE_THRESHOLD (predefinito 0.42: più alto = più severo). Le frasi di un ospite non entrano nella tua memoria.
+
+COSA PUOI DIRE
+--------------
+Conversazione:  parla normalmente. Per i compiti difficili, scrivere codice o creare moduli usa il modello CODER.
+Media:      "metti in pausa" - "riprendi" - "prossima canzone" - "canzone precedente"
+Finestre:   "minimizza" - "massimizza" - "chiudi la finestra" - "cambia finestra" - "mostra il desktop"
+            "passa a Chrome" - "sposta la finestra a sinistra" - "quali finestre ho aperte"
+Tastiera:   "digita ciao a tutti" - "premi invio" - "premi controllo c" - "copia" - "incolla" - "seleziona tutto"
+Mouse:      "clicca" - "doppio clic" - "clic destro" - "scorri giù" - "scorri su di 10" - "sposta il mouse al centro"
+Schermo:    "fai uno screenshot" - "luminosità al 60" - "alza la luminosità" (sui portatili)
+Sistema:    "blocca il computer" - "stato della batteria" - "quanto spazio ho sul disco"
+            "apri gestione attività" - "apri le impostazioni del wifi" - "apri la calcolatrice"
+File:       "trova il file fattura marzo" - "apri il file fattura marzo" - "apri la cartella download"
+            "cosa c'è nel desktop" - "crea una cartella Progetti sul desktop"
+Con conferma a voce (rispondi "conferma" entro 30 secondi, oppure "annulla"):
+            "spegni il computer" - "riavvia il computer" - "metti il computer in sospensione" - "chiudi la sessione"
+            "svuota il cestino" - "cancella il file fattura marzo" (va nel cestino). "annulla lo spegnimento" lo ferma.
+Posta:      "ci sono email nuove?" - "leggi l'ultima email" - "scrivi un'email a Marco per dirgli che..."
+            Jarvis prepara la bozza, la rilegge e la invia solo dopo il tuo "invia".
+Memoria:    "ricorda che..." - "dimentica che..." - "cosa sai di me?"
+File e cartelle si toccano solo dentro la tua cartella utente (Desktop, Documenti, Download, Immagini, Musica, Video).
 
 VOCE
 ----
-Per scegliere la voce:  python provavoce.py   (le fa ascoltare una dopo l'altra e salva quella che preferisci)
-Oppure a voce, mentre parli con Jarvis:  "usa la voce di Diego" - "cambia voce" - "elenco voci"
+"usa la voce di Nicola" (uomo) / "usa la voce di Sara" (donna): voci OFFLINE, scaricano circa 90 MB la prima volta e poi
+funzionano senza internet. nicola-hd / sara-hd: qualità massima (circa 310 MB).
+Altre: elsa (Windows), diego, giuseppe, isabella (Edge, online), paola, riccardo (Piper, offline).
+"cambia voce" - "elenco voci". Per provarle una dopo l'altra:  python provavoce.py
 
-  elsa, windows            voce di Windows, offline (quella usata finora)
-  diego, giuseppe          neurali maschili, molto naturali, richiedono internet
-  isabella                 neurale femminile, richiede internet
-  nicola (uomo), sara (donna)   VOCI OFFLINE CONSIGLIATE (Kokoro). La prima volta Jarvis scarica
-                           ~90 MB nella cartella "voices" (serve internet una volta sola), poi
-                           funzionano senza internet per sempre. Comando: "usa la voce di Nicola".
-                           nicola-hd / sara-hd: qualita' massima, ~310 MB.
-                           Servono: pip install kokoro-onnx espeakng-loader
-  paola, riccardo          neurali offline (pip install piper-tts; la voce si scarica da sola;
-                           riccardo e' di qualita' bassa)
+MODULI CREATI DA JARVIS
+-----------------------
+"crea un modulo che converte le valute" / "impara a ...": il modello CODER scrive il codice, Jarvis lo controlla e lo
+mette in moduli\_pending. Dì "installa" per attivarlo (compare collegato sulla mappa) oppure "annulla".
+Poi basta chiedere "converti 10 euro in dollari". Jarvis non modifica mai da solo i suoi file principali.
 
-Prima: pip install -r requirements.txt   (installa edge-tts e miniaudio per le voci online)
-Se internet non c'e', Jarvis continua a parlare con la voce di Windows.
-La scelta e' salvata in voice.json (accanto a main.py); la variabile JARVIS_VOICE ha la precedenza.
-Le voci online usano il servizio di sintesi di Microsoft Edge tramite la libreria non ufficiale edge-tts.
+PLACCHE E INTERRUTTORI SONOFF
+-----------------------------
+python scansonoff.py   (PC nella stessa rete delle placche): elenca quelle che si lasciano comandare in locale. Scrive scansonoff_risultato.txt.
 
-MODELLO
+IMPOSTAZIONI (ingranaggio in alto a destra, oppure F9)
+------------------------------------------------------
+MODELLI    tutti i modelli Ollama installati, con i GB che occupano. Per ognuno: acceso/spento e per cosa va usato
+           (chat, veloce, difficile, codice, ragionamento, immagini). "Chat base" = il modello delle conversazioni di tutti i giorni.
+           Jarvis sceglie da solo il più adatto: chat normale -> il modello base; domande difficili, codice, moduli, matematica ->
+           il modello giusto tra quelli accesi. Se un modello non parte (poca memoria) passa al successivo.
+           Scaricare: scegli dall'elenco (con i GB) o scrivi un nome, premi Scarica: vedi barra e GB scaricati, con Annulla.
+           Eliminare: seleziona la riga, "Elimina il modello selezionato": cancella anche i file dal disco e libera lo spazio.
+           I modelli cloud (es. kimi-k3.1-pro:cloud) sono a pagamento e restano spenti finché non li accendi tu.
+POSTA      più account (Gmail, iCloud, Yahoo o altro): indirizzo, password per le app, nome. "Prova accesso" controlla subito che
+           funzioni. A voce: "quali account hai", "usa l'account lavoro". Le password stanno in data\accounts.json.
+VOCI       le persone che Jarvis riconosce, "dimentica la voce", "ascolta solo il proprietario".
+A voce: "quali modelli hai".  Non serve più modificare config.json o il file .env per modelli e posta.
+
+MODELLI
 -------
-Il modello predefinito ora è qwen2.5 (cioè qwen2.5:latest, 4,7 GB: quello che hai già).
-Per cambiarlo: DEFAULT_MODEL in modules/brain.py oppure la variabile d'ambiente JARVIS_MODEL
-(es. JARVIS_MODEL=qwen2.5-coder:14b). Se il modello manca, main.py propone di scaricarlo.
+Se il modello grande non parte (errore 500 di Ollama, di solito memoria insufficiente: il 14b vuole circa 9-10 GB liberi),
+Jarvis lo dice, usa il modello normale e riprova col grande dopo 10 minuti. Per un modello più leggero:
+  ollama pull qwen2.5-coder:7b   e imposta la variabile JARVIS_CODER_MODEL=qwen2.5-coder:7b
+Normale: qwen2.5 (variabile JARVIS_MODEL).  Grande: qwen2.5-coder:14b (JARVIS_CODER_MODEL), caricato solo quando serve.
 
-SE QUALCOSA NON VA
-------------------
-Guarda jarvis.log e jarvis_crash.log accanto a main.py.
+COMPILARE L'EXE
+---------------
+Doppio clic su compila.bat: crea dist\Jarvis.exe. I dati restano fuori dall'exe (cartelle sopra): ricompilare non li cancella.
+Metti .env accanto all'exe. Se qualcosa non va, guarda logs\jarvis.log.
 
-DUE MODELLI
------------
-- Conversazione, comandi, email:  qwen2.5 (veloce, quello di prima). Cambia con JARVIS_MODEL.
-- Compiti complessi e autoaggiornamento: qwen2.5-coder:14b. Cambia con JARVIS_CODER_MODEL.
-  Il modello grande si carica solo quando serve e Ollama lo scarica dalla memoria dopo 5 minuti.
-  Va al modello grande: "scrivimi una funzione/script ...", "correggi questo codice", "ragiona a fondo ...",
-  "crea un modulo che ...", "impara a ...", "migliorati", "aggiungi una funzione ..."
-  e i problemi difficili che il modello normale decide di passargli.
-- Un modulo creato finisce sempre in tools/_pending, viene controllato e si attiva solo se dici "installa".
-  Jarvis non modifica mai da solo i suoi file principali.
-- Se il modello grande non e' installato, Jarvis lo dice e usa quello normale.
+MAPPA NEURALE DINAMICA E RIGA MODELLO
+- Nella mappa ogni modello Ollama acceso in Impostazioni compare come nodo attorno al cervello
+  (BASE = modello di chat principale). Se ne accendi o spegni, la mappa si ridisegna da sola.
+- Quando Jarvis usa un modello, il nodo si illumina e in alto a destra compare "RAGIONA CON <modello>".
+- A sinistra, vicino alle specifiche del PC, la riga MODELLO mostra il modello base; durante una risposta
+  diventa "▶ nome · BASE" oppure "▶ nome · POTENTE" (se sta usando un modello diverso dal base).
 
-CONTROLLO DEL COMPUTER (pc_tools.py -> modules/tools/)
------------------------------------------------------
-Prima: pip install -r requirements.txt   (serve pillow per gli screenshot e send2trash per cancellare in sicurezza)
-Esempi di comandi (funzionano subito, senza passare dal modello):
-  Media:      "metti in pausa" - "riprendi" - "prossima canzone" - "canzone precedente"
-  Finestre:   "minimizza" - "massimizza" - "chiudi la finestra" - "cambia finestra" - "mostra il desktop"
-              "passa a Chrome" - "sposta la finestra a sinistra" - "quali finestre ho aperte"
-  Tastiera:   "digita ciao a tutti" - "premi invio" - "premi controllo c" - "copia" - "incolla" - "seleziona tutto"
-  Mouse:      "clicca" - "doppio clic" - "clic destro" - "scorri giu" - "scorri su di 10" - "sposta il mouse al centro"
-  Schermo:    "fai uno screenshot" - "luminosita al 60" - "alza la luminosita"   (la luminosita funziona sui portatili)
-  Sistema:    "blocca il computer" - "stato della batteria" - "quanto spazio ho sul disco"
-              "apri gestione attivita" - "apri le impostazioni del wifi" - "apri la calcolatrice"
-  File:       "trova il file fattura marzo" - "apri il file fattura marzo" - "apri la cartella download"
-              "cosa c'e nel desktop" - "crea una cartella Progetti sul desktop"
-CON CONFERMA A VOCE (Jarvis chiede "Vuoi davvero...?", rispondi "conferma" entro 30 secondi, oppure "annulla"):
-  "spegni il computer" - "riavvia il computer" - "metti il computer in sospensione" - "chiudi la sessione"
-  "svuota il cestino" - "cancella il file fattura marzo" (va nel cestino, si puo recuperare)
-  Lo spegnimento parte dopo 30 secondi: "annulla lo spegnimento" lo ferma.
-Sicurezza: i file si cercano e si toccano solo nella tua cartella utente (Desktop, Documenti, Download, Immagini,
-Musica, Video). Non c'e un comando libero per eseguire programmi da terminale.
-Altro: a richiesta il modello usa gli strumenti "pc.*" anche con frasi non previste.
+PANNELLO "ELABORAZIONE DATI" (sotto la chat, a destra)
+- Mostra in tempo reale cosa fa Jarvis: ASCOLTO (attesa/microfono aperto), INPUT (cosa ha capito, voce e parole),
+  PENSIERO, MODELLO (quale modello Ollama, base o potente), STRUMENTO/SERVIZIO usati, OUTPUT (ogni frase),
+  TEMPO (prima frase e risposta completa) e le righe di log di moduli/errori.
+- F10 mostra/nasconde il pannello. Il log completo resta comunque in jarvis.log.
 
-DOVE JARVIS TIENE I SUOI FILE (e come compilare l'exe)
------------------------------------------------------
-Tutto sta nella STESSA cartella di Jarvis.exe (o di main.py se lo avvii da Python), in cartelle ordinate:
-  .env           la password della posta (lo scrivi tu: copia env_example.txt, che Jarvis mette li' al primo avvio)
-  config.json    moduli attivi/disattivi (creato al primo avvio)
-  data\          memoria (memory.json), stato posta (mail_state.json), voce scelta (voice.json)
-  logs\          jarvis.log e jarvis_crash.log (se qualcosa non va, guarda qui)
-  voices\        le voci offline scaricate (nicola, sara...)
-  moduli\        i moduli creati da Jarvis e installati; moduli\_pending = in attesa del tuo "installa"
-Spostare o copiare l'exe in un'altra cartella = Jarvis riparte da zero li'. Per portare con te la memoria e le voci
-copia le cartelle data e voices. Se la cartella non e' scrivibile (es. C:\Program Files) usa %LOCALAPPDATA%\Jarvis.
-Vecchie versioni: al primo avvio da Python, memory.json, mail_state.json e voice.json vengono copiati in data\.
-Compilare: doppio clic su compila.bat (installa PyInstaller, crea dist\Jarvis.exe). Ricompilare NON cancella i dati,
-perche' stanno fuori dall'exe. Con l'exe la voce Piper si scarica da sola; Kokoro (nicola, sara) e' comunque consigliata.
-Dentro modules\tools\ restano i moduli integrati (compreso module_manager.py: sostituisci il tuo con questo).
+MICROFONO SEMPRE IN ASCOLTO
+- All'avvio Jarvis ascolta da solo e aspetta la parola «Jarvis»: non ci sono più i pulsanti AUTO e PARLA.
+- Resta un solo pulsante in basso: "MIC ●" (verde = in ascolto). Premendolo diventa "MUTO" (rosso): il microfono
+  è spento e Jarvis è a riposo, ma puoi sempre scrivergli. Si può usare anche F8. Premi di nuovo per riattivarlo.
+- Per non avviare l'ascolto all'accensione: variabile d'ambiente JARVIS_AUTOSTART=0.
+
+AGGIORNAMENTI OTA DA GITHUB (rilascio manuale)
+1) Una volta sola: in modules/version.py scrivi il tuo repository in UPDATE_REPO = "utente/repository" (finisce dentro l'exe).
+   Se il repository è privato aggiungi GITHUB_TOKEN=... nel .env accanto all'exe.
+2) Per ogni nuova versione:
+   a) in modules/version.py cambia VERSION (es. "1.0.0" -> "1.1.0");
+   b) compila (compila.bat) -> dist\Jarvis.exe;
+   c) su GitHub crea una nuova Release con tag uguale alla versione (es. v1.1.0) e carica Jarvis.exe tra gli asset.
+   Il numero del tag e VERSION dentro l'exe devono coincidere, altrimenti Jarvis penserà di essere sempre indietro.
+3) Jarvis controlla da solo all'avvio e ogni 6 ore e te lo dice. Comandi vocali: «controlla gli aggiornamenti»,
+   «installa l'aggiornamento», «che versione sei». Anche da Impostazioni > AGGIORNAMENTI.
+   L'installazione (solo il proprietario) scarica l'exe, verifica che sia valido, si chiude, sostituisce il file e si riavvia.
+   L'exe precedente resta come Jarvis.exe.bak. config.json, .env, data, voci e moduli creati non vengono toccati.
+
+CHIUSURA DURANTE L'AVVIO
+- Nella schermata di avvio il clic non fa più sparire la finestra. C'è il pulsante "ANNULLA E CHIUDI" (anche Esc o Alt+F4):
+  ferma il download di Ollama/del modello, l'installer e chiude del tutto Jarvis.
+- Anche chiudendo la finestra principale il programma termina completamente (ascolto, download e thread compresi).

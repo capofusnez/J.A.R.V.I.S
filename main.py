@@ -7,7 +7,7 @@ import logging
 import threading
 import traceback
 import faulthandler
-from PyQt6.QtWidgets import QApplication, QSplashScreen, QLabel, QVBoxLayout, QMessageBox, QFrame
+from PyQt6.QtWidgets import QApplication, QSplashScreen, QLabel, QVBoxLayout, QMessageBox, QFrame, QPushButton
 from PyQt6.QtGui import QFont, QColor, QPainter, QPen
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 
@@ -22,8 +22,15 @@ LOG_PATH = os.path.join(LOGS_DIR, "jarvis.log")
 
 def setup_logging():
     """Tutto quello che succede all'avvio finisce in jarvis.log: utile se qualcosa va storto."""
-    logging.basicConfig(filename=LOG_PATH, level=logging.INFO, encoding="utf-8",
+    # force=True: se una libreria ha già acceso il log (su stderr, invisibile senza console) lo sostituisce con il file
+    logging.basicConfig(filename=LOG_PATH, level=logging.INFO, encoding="utf-8", force=True,
                         format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        from modules.paths import EARLY_LOG
+        for level, msg in EARLY_LOG:
+            logging.log(level, msg)
+    except Exception:
+        pass
 
 
 def install_excepthook():
@@ -107,8 +114,12 @@ class HudProgressBar(QFrame):
 
 class FuturisticSplash(QSplashScreen):
     """Finestra di caricamento futuristica stile HUD Stark."""
+    cancel_requested = pyqtSignal()
+
     def __init__(self):
         super().__init__()
+        self._finishing = False
+        self._drag = None
         self.setFixedSize(520, 290)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         
@@ -155,6 +166,39 @@ class FuturisticSplash(QSplashScreen):
         self.progress_bar = HudProgressBar()
         layout.addWidget(self.progress_bar)
         layout.addStretch(1)
+        cancel_btn = QPushButton("ANNULLA E CHIUDI")
+        cancel_btn.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.setStyleSheet("QPushButton { background: #0d1b2a; color: #00f3ff; border: 1px solid #00a8b3; padding: 5px 12px; }"
+                                 "QPushButton:hover { background: #ff4848; color: #080c14; border-color: #ff4848; }")
+        cancel_btn.clicked.connect(self.cancel_requested.emit)
+        layout.addWidget(cancel_btn, 0, Qt.AlignmentFlag.AlignRight)
+
+    # QSplashScreen di serie si nasconde al primo clic lasciando l'avvio in background: qui il clic non chiude nulla
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, event):
+        if self._drag is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag)
+
+    def mouseReleaseEvent(self, event):
+        self._drag = None
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.cancel_requested.emit()
+        else:
+            super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        """Chiudere la finestra (Alt+F4) = annullare l'avvio, non lasciarlo andare avanti nascosto."""
+        if not self._finishing:
+            event.ignore()
+            self.cancel_requested.emit()
+        else:
+            super().closeEvent(event)
 
     def update_status(self, text: str):
         self.status_label.setText(text)
@@ -194,6 +238,16 @@ class OllamaStartupWorker(QThread):
         super().__init__()
         self._answer = False
         self._answered = threading.Event()
+        self.setup = None
+        self.cancelled = False
+
+    def cancel(self):
+        """Ferma tutto: download in corso, installer, domande in attesa."""
+        self.cancelled = True
+        if self.setup is not None:
+            self.setup.cancel()
+        self._answer = False
+        self._answered.set()
 
     def answer(self, value: bool):
         self._answer = value
@@ -211,6 +265,8 @@ class OllamaStartupWorker(QThread):
         self.progress_signal.emit(-1 if v is False else -2 if v is None else int(v * 1000))
 
     def _ask(self, title: str, text: str, yes: str = "Sì", no: str = "No") -> bool:
+        if self.cancelled:
+            return False
         self._answer = False
         self._answered.clear()
         self.ask_signal.emit(title, text, yes, no)
@@ -229,10 +285,14 @@ class OllamaStartupWorker(QThread):
             self.status_signal.emit("[CHECK] Inizializzazione socket di rete locali...")
             time.sleep(0.3)
 
-            setup = OllamaSetup(MODEL_NAME, self._status, self._ask, self._progress)
+            if self.cancelled:
+                return
+            setup = self.setup = OllamaSetup(MODEL_NAME, self._status, self._ask, self._progress)
             ok = False
             for _ in range(3):
                 ok = setup.ensure()
+                if self.cancelled:
+                    return
                 if ok or not setup.last_error:
                     break
                 # errore vero (non un semplice rifiuto): resta visibile e si può riprovare
@@ -254,7 +314,8 @@ class OllamaStartupWorker(QThread):
             self.status_signal.emit(f"[ERROR] Avvio incompleto: {e}")
             time.sleep(1.5)
         finally:
-            self.finished_signal.emit()            # la GUI si apre comunque, anche se qualcosa è andato storto
+            if not self.cancelled:
+                self.finished_signal.emit()        # la GUI si apre comunque, anche se qualcosa è andato storto
 
 
 def show_question(title: str, text: str, yes_text: str, no_text: str, worker: "OllamaStartupWorker", splash):
@@ -292,6 +353,16 @@ def show_question(title: str, text: str, yes_text: str, no_text: str, worker: "O
             pass
 
 
+def hard_exit(code: int = 0):
+    """Esce subito chiudendo ogni thread: download, ascolto o modello in corso non devono restare vivi dopo la chiusura."""
+    logging.info("Uscita (codice %s)", code)
+    try:
+        logging.shutdown()
+    except Exception:
+        pass
+    os._exit(code)
+
+
 if __name__ == "__main__":
     setup_logging()
     install_excepthook()
@@ -320,7 +391,7 @@ if __name__ == "__main__":
     worker.ask_signal.connect(lambda t, x, y, n: show_question(t, x, y, n, worker, splash))
     
     window = None
-    def on_ready():
+    def _on_ready_inner():
         global window
         splash.finish(None)  # Chiusura pulita della splash
         try:
@@ -334,7 +405,25 @@ if __name__ == "__main__":
                                  "Impossibile aprire l'interfaccia. I dettagli sono in logs/jarvis.log")
             app.quit()
 
+    def on_cancel():
+        """Finestra di avvio chiusa/annullata: ferma i download ed esce del tutto (niente processi rimasti in background)."""
+        logging.info("[AVVIO] annullato dall'utente")
+        splash.status_label.setText("[STOP] Annullamento in corso...")
+        worker.cancel()
+        worker.wait(3000)                              # i download si fermano entro un attimo
+        hard_exit(0)
+
+    splash.cancel_requested.connect(on_cancel)
+
+    def on_ready():
+        global window
+        if worker.cancelled:
+            return
+        splash._finishing = True
+        _on_ready_inner()
+
     worker.finished_signal.connect(on_ready)
     worker.start()
 
-    sys.exit(app.exec())
+    code = app.exec()
+    hard_exit(code)

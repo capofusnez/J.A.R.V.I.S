@@ -5,6 +5,7 @@ import time
 import shutil
 import tempfile
 import subprocess
+import threading
 import collections
 import requests
 
@@ -82,7 +83,21 @@ class OllamaSetup:
         self.base_url = base_url
         self.installer_url = installer_url
         self._last_report = 0.0
+        self._cancel = threading.Event()
         self.last_error = None          # ultimo errore reale (non il semplice rifiuto dell'utente)
+
+    # ---------------- annullamento ----------------
+    def cancel(self):
+        """Interrompe subito download, installazione e attese (chiamato quando si chiude la finestra di avvio)."""
+        self._cancel.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def _check_cancel(self):
+        if self._cancel.is_set():
+            raise InterruptedError("annullato dall'utente")
 
     # ---------------- progresso ----------------
     def _prog(self, v):
@@ -122,7 +137,7 @@ class OllamaSetup:
             if self.server_up():
                 return True
             elapsed = time.time() - t0
-            if elapsed >= timeout:
+            if elapsed >= timeout or self.cancelled:
                 return False
             self.status(f"[WAIT] {label}...\nTempo trascorso: {int(elapsed)} s")
             time.sleep(0.5)
@@ -175,6 +190,7 @@ class OllamaSetup:
                 done = 0
                 with open(part, "wb") as f:
                     for chunk in r.iter_content(256 * 1024):
+                        self._check_cancel()
                         if chunk:
                             f.write(chunk)
                             done += len(chunk)
@@ -204,6 +220,9 @@ class OllamaSetup:
             proc = subprocess.Popen([path] + SILENT_ARGS, creationflags=NO_WINDOW)
             while proc.poll() is None:
                 elapsed = time.time() - t0
+                if self.cancelled:
+                    proc.kill()
+                    return False
                 if elapsed > 900:
                     proc.kill()
                     return False
@@ -283,6 +302,7 @@ class OllamaSetup:
                                stream=True, timeout=(10, 120)) as r:
                 r.raise_for_status()
                 for line in r.iter_lines(chunk_size=1):                  # riga per riga: niente aggiornamenti a scatti
+                    self._check_cancel()
                     if not line:
                         continue
                     d = json.loads(line)

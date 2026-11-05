@@ -7,10 +7,13 @@ import datetime
 import requests
 import random
 import inspect
+import logging
 from modules.tools import LocalTools
-from modules.module_builder import validate_code, sanitize_module_name, build_module_prompt
+from modules.models import get_registry, is_cloud
+from modules.accounts import get_accounts
+from modules.module_builder import validate_code, sanitize_module_name, build_module_prompt, parse_module_reply, prepare_code, smoke_test
 from modules.memory import MemoryStore
-from modules.paths import DATA_DIR, TOOLS_DIR
+from modules.paths import DATA_DIR, TOOLS_DIR, PENDING_DIR, env_problem
 from modules.mail import MailConfig, MailClient, MailWatcher, spoken_to_address
 
 try:
@@ -135,6 +138,8 @@ CONFIRM_RE = re.compile(
     r"(?:[,.\s]+(?:conferma|confermo|procedi|pure|esegui|fallo))*$", re.I)
 DENY_RE = re.compile(r"^(?:no|no grazie|fermo|ferma|stop|aspetta|un attimo|lascia stare|meglio di no)$", re.I)
 CONFIRM_TTL = 30
+INSTALL_WORD_RE = re.compile(r"\b(?:install\w*|attiv\w*|carica\w*|conferm\w*|procedi|procedere)\b", re.I)
+INSTALL_NO_RE = re.compile(r"\b(?:non|niente|no)\b", re.I)
 SAVE_RE = re.compile(r"^salva$|\bsalva(?:la)?\b.*\bbozz\w*|\b(?:metti|mettila)\b.*\bbozz\w*", re.I)
 MODIFY_RE = re.compile(
     r"^(?:no|ok|anzi|però|ma|allora|sì|si)?[,.\s]*(?:aggiungi|togli|rimuovi|cambia|modifica|rendi|rendila|sostituisci|"
@@ -168,11 +173,11 @@ class LocalBrain:
     MAX_HISTORY = 14
 
     def __init__(self, model_name=DEFAULT_MODEL, coder_model=CODER_MODEL):
-        self.model_name = model_name
-        self.coder_model = coder_model
+        self.url = "http://localhost:11434/api/chat"
+        # elenco dei modelli Ollama (Impostazioni > Modelli): Jarvis sceglie il più adatto a ogni richiesta
+        self.registry = get_registry(self.url.replace("/api/chat", ""), model_name)
         self.last_model = model_name                 # modello usato per l'ultima risposta (la GUI può mostrarlo)
         self._tags_cache = (0.0, set())
-        self.url = "http://localhost:11434/api/chat"
         self.tools = LocalTools()
         self.session = requests.Session()
         self.memory = MemoryStore(os.path.join(DATA_DIR, "memory.json"))
@@ -184,11 +189,14 @@ class LocalBrain:
         self._skip_extract = False
 
         self.pending = None
+        self.current_speaker = None          # chi parla secondo la voce: {"name","score","known"}; None = scritto a tastiera
+        self._voice_ask_until = 0.0          # prima di quest'ora non richiede il nome a una voce sconosciuta
 
+        self.accounts = get_accounts()                 # gli account si gestiscono da Impostazioni (o dal vecchio .env)
         self.mail = None
-        cfg = MailConfig.from_env()
-        if cfg:
-            self.mail = MailClient(cfg, os.path.join(DATA_DIR, "mail_state.json"))
+        self.watcher = None
+        self.on_mail_alert = None
+        self._setup_mail()
         self.watcher = None
         self.recent_mail = []
         self.mail_list = []
@@ -198,6 +206,295 @@ class LocalBrain:
 
         self.on_mail_alert = None
         self.on_learned = None
+        self.on_event = None                         # callback(tipo, nome): la GUI mostra cosa sta facendo Jarvis
+
+    # ---------------- eventi per la mappa neurale ----------------
+    def _setup_mail(self):
+        """Collega l'account di posta attivo (quello scelto in Impostazioni; in mancanza, il vecchio .env)."""
+        acc = self.accounts.active()
+        cfg = self.accounts.config(acc) if acc else MailConfig.from_env()
+        if cfg:
+            path = self.accounts.state_path(acc) if acc else os.path.join(DATA_DIR, "mail_state.json")
+            self.mail = MailClient(cfg, path)
+        else:
+            self.mail = None
+            logging.warning("[POSTA] non configurata: %s", env_problem() or "provider sconosciuto o dati incompleti")
+
+    def reload_mail(self) -> bool:
+        """Da chiamare dopo aver cambiato account o dati in Impostazioni."""
+        cb = self.on_mail_alert
+        if self.watcher:
+            self.watcher.stop()
+            self.watcher = None
+        self.recent_mail, self.mail_list, self.last_mail = [], [], None
+        self._setup_mail()
+        if self.mail and cb:
+            self.start_mail_watcher(cb)
+        return self.mail is not None
+
+    @property
+    def model_name(self) -> str:
+        return self.registry.chat_model()            # il modello della chat di tutti i giorni
+
+    @property
+    def coder_model(self) -> str:
+        return self.registry.pick("complex")         # il modello per i compiti difficili
+
+    def _is_big(self, model: str) -> bool:
+        return self.registry.is_big(model)
+
+    def _emit(self, kind: str, name: str = ""):
+        cb = self.on_event
+        if cb:
+            try:
+                cb(kind, name)
+            except Exception:
+                pass
+
+    def _module_key(self, fn) -> str:
+        inst = getattr(fn, "__self__", None)
+        manager = getattr(self.tools, "manager", None)
+        if manager is not None and inst is not None:
+            for k, v in list(manager.loaded_modules.items()):
+                if v is inst:
+                    return k
+        return ""
+
+    def neural_snapshot(self) -> dict:
+        """Stato reale dei collegamenti: moduli caricati / disattivati / in attesa, modelli, servizi."""
+        manager = getattr(self.tools, "manager", None)
+        mods, seen = [], set()
+        if manager is not None:
+            for key, (path, _cls) in sorted(list(manager.module_registry.items())):
+                inst = manager.loaded_modules.get(key)
+                n = 0
+                if inst is not None:
+                    n = sum(1 for a in dir(inst) if not a.startswith("_") and callable(getattr(inst, a, None)))
+                mods.append({"key": key, "state": "connected" if inst is not None else "disabled",
+                             "ext": str(path).startswith("file:"), "tools": n,
+                             "error": getattr(manager, "load_errors", {}).get(key, "")})
+                seen.add(key)
+        try:
+            for f in sorted(os.listdir(PENDING_DIR)):
+                k = re.sub(r"_tools$", "", f[:-3]) if f.endswith(".py") else ""
+                if k and k not in seen:
+                    mods.append({"key": k, "state": "pending", "ext": True, "tools": 0})
+        except OSError:
+            pass
+        if manager is not None:
+            for key in sorted(getattr(manager, "failed", ())):          # file presenti ma che non si importano
+                if key not in seen:
+                    mods.append({"key": key, "state": "disabled", "ext": False, "tools": 0,
+                                 "error": manager.load_errors.get(key, "errore di importazione")})
+                    seen.add(key)
+        reg = self.registry
+        names = set(reg.names())
+        chat, big = self.model_name, self.coder_model
+        shown = []                                           # i modelli accesi in Impostazioni: uno nodo ciascuno sulla mappa
+        for n in sorted(names, key=lambda n: (n != chat, reg.installed.get(n, {}).get("size", 0) or 0)):
+            p = reg.profile(n)
+            if n == chat or (p["enabled"] and p["tags"]):
+                shown.append({"name": n, "ok": True, "base": n == chat, "tags": list(p["tags"]),
+                              "gb": 0.0 if is_cloud(n) else round((reg.installed.get(n, {}).get("size", 0) or 0) / 1024 ** 3, 1),
+                              "cloud": is_cloud(n)})
+        shown = shown[:7]
+        shown.sort(key=lambda m: (m["gb"] if not m["cloud"] else 10 ** 6))      # dal più leggero al più potente
+        if not shown:
+            shown = [{"name": chat, "ok": False, "base": True, "tags": ["chat"], "gb": 0.0, "cloud": False}]
+        return {
+            "modules": mods,
+            "ollama": bool(names),
+            "models": {"list": shown,
+                       "chat": {"name": chat, "ok": chat in names},
+                       "coder": {"name": big, "ok": big in names and big != chat}},
+            "services": {"mail": self.mail is not None, "web": DDGS is not None, "memory": len(self.memory.facts())},
+        }
+
+    # ---------------- riconoscimento della voce
+    _NAME_STOP = {"io", "me", "lui", "lei", "un", "una", "il", "lo", "la", "di", "del", "della", "che", "qui", "mia", "mio",
+                  "tua", "sua", "stato", "stata", "ancora", "adesso", "ora", "voce", "la", "le", "dei", "delle", "suo", "è", "e"}
+    SENSITIVE_RE = re.compile(
+        r"\b(?:spegn\w+|riavvi\w+|sospension\w+|sospendi|chiudi la sessione|disconnett\w+|svuota|cancell\w+|elimin\w+|"
+        r"rimuov\w+|invia\w*|manda\w*|email|mail|posta|account|modello|modelli|modulo|moduli|installa|digita|premi|clicca|clic|mouse|tastiera|"
+        r"screenshot|schermata|luminosit\w+|blocca il (?:computer|pc))\b", re.I)
+
+    def _vid(self):
+        try:
+            from modules.voiceid import get_voiceid
+            return get_voiceid()
+        except Exception:
+            return None
+
+    def _name_from(self, s: str):
+        for w in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']{2,20}", s or ""):
+            if w.lower() not in self._NAME_STOP:
+                return w[:1].upper() + w[1:].lower()
+        return None
+
+    def _voice_ready_msg(self, vid):
+        """None se il riconoscimento funziona; altrimenti la frase da dire (e avvia lo scaricamento del modello)."""
+        if vid is None or vid.ready:
+            return None
+        if "non ancora scaricato" in vid.error:
+            threading.Thread(target=vid.prepare, daemon=True).start()
+            return "Sto scaricando il modello per riconoscere le voci, circa 26 mega, una volta sola. Riprova tra un minuto."
+        return f"Il riconoscimento delle voci non è attivo: {vid.error or 'modello non disponibile'}."
+
+    def _is_guest(self) -> bool:
+        """True se la voce attuale non è quella del proprietario (a tastiera si è sempre il proprietario)."""
+        vid = self._vid()
+        sp = self.current_speaker
+        if vid is None or not vid.owner or not vid.ready or sp is None or os.environ.get("JARVIS_VOICE_GATE") == "0":
+            return False
+        return sp.get("name") != vid.owner
+
+    def _guest_gate(self, text: str):
+        if not self._is_guest():
+            return None
+        owner = self._vid().owner
+        who = self.current_speaker.get("name")
+        if self.pending and self.pending.get("kind") in ("action_confirm", "email_confirm", "module_confirm"):
+            return f"Questa conferma la accetto solo dalla voce di {owner}."
+        if self.SENSITIVE_RE.search(text):
+            return (f"{'Ciao ' + who + ', q' if who else 'Q'}uesta richiesta la accetto solo dalla voce di {owner}. "
+                    "Se sei lui, ripetila con la voce normale o scrivila.")
+        return None
+
+    def _voice_commands(self, t: str, clean: str):
+        """Comandi sul riconoscimento della voce. Ritorna None se la frase non li riguarda."""
+        vid = self._vid()
+        if not re.search(r"\bvoc[ei]\b|\bchi (?:sta )?parl(?:a|ando)\b|\bchi sono\b|\bsta parlando\b|\bparla ora\b|\bora parla\b|"
+                         r"\bsolo (?:a )?me\b|\btutti\b.*\b(?:rispondi|ascolta)|\b(?:rispondi|ascolta)\b.*\btutti\b|"
+                         r"\bsono io\b|\bsto parlando io\b|\bchi (?:conosci|riconosci)\b|\bpersone\b.*\b(?:conosci|riconosci)\b", t):
+            return None
+        # solo il proprietario
+        if re.search(r"\b(?:rispondi|ascolta|obbedisci)\b.*\b(?:solo|soltanto)\b.*\bme\b|\bsolo la mia voce\b", t):
+            if vid is None or not vid.set_only_owner(True):
+                return "Prima devo conoscere la tua voce. Dì: impara la mia voce, sono, e il tuo nome."
+            return f"D'accordo, ascolto solo {vid.owner}. Per tornare indietro dì: rispondi a tutti."
+        if re.search(r"\b(?:rispondi|ascolta)\b.*\b(?:a )?tutti\b", t):
+            if vid is not None:
+                vid.set_only_owner(False)
+            return "D'accordo, ascolto chiunque mi chiami."
+        # chi parla
+        if re.match(r"^(?:chi (?:sta )?parl(?:a|ando)|chi sono(?: io)?|chi è che parla|riconosci (?:la mia )?voce|riconosci chi parla)\b", t):
+            if vid is None:
+                return "Il riconoscimento delle voci non è disponibile."
+            msg = self._voice_ready_msg(vid)
+            if msg:
+                return msg
+            if not vid.names():
+                return "Non conosco ancora nessuna voce. Dì: impara la mia voce, sono, e il tuo nome."
+            sp = self.current_speaker or {}
+            if sp.get("name"):
+                return f"Sei {sp['name']}." if sp["name"] == vid.owner else f"Riconosco {sp['name']}."
+            return "Non riconosco questa voce. Dimmi chi sei e la imparo."
+        # elenco
+        if re.search(r"\b(?:chi|quali persone|quali voci)\b.*\b(?:conosci|riconosci)\b|\bvoci conosciute\b", t):
+            names = vid.names() if vid else []
+            if not names:
+                return "Non conosco ancora nessuna voce."
+            return "Riconosco: " + ", ".join(names) + (f". Il proprietario è {vid.owner}." if vid.owner else ".")
+        # dimentica
+        m = re.search(r"\b(?:dimentica|cancella|elimina)\b.*\bvoce (?:di|del|della|dell')\s*(\w+)", t)
+        if m and vid is not None:
+            n = self._name_from(m.group(1))
+            return f"Ho dimenticato la voce di {n}." if n and vid.forget(n) else "Non conosco quella voce."
+        # impara una voce (guidato: le prossime frasi)
+        m = re.search(r"\b(?:impara|ricorda|memorizza|registra|riconosci)\b.*\bvoce\b(.*)$", t)
+        if m and re.search(r"\b(?:impara|ricorda|memorizza|registra)\b", t):
+            msg = self._voice_ready_msg(vid)
+            if msg:
+                return msg
+            rest = m.group(1)
+            nm = re.search(r"(?:di|del|della|dell')\s+(\w+)|(?:sono|mi chiamo|si chiama)\s+(\w+)", rest) or \
+                 re.search(r"(?:sono|mi chiamo)\s+(\w+)", t)
+            name = self._name_from(next((g for g in (nm.groups() if nm else ()) if g), "")) if nm else None
+            if name is None and re.search(r"\b(?:mia|mio)\b", t) and (self.current_speaker or {}).get("name"):
+                name = self.current_speaker["name"]                     # affina una voce già nota
+            if not name:
+                self.pending = {"kind": "voice_name_learn", "ts": time.time(), "ttl": 60}
+                return "Come ti chiami?"
+            return self._start_voice_learning(vid, name)
+        # "sta parlando Marco": assegna le frasi appena sentite
+        m = re.search(r"\b(?:sta parlando|ora parla|adesso parla|chi parla è|chi stava parlando era|chi ha parlato (?:è|era)|"
+                      r"questa voce è(?: di)?|quella voce era(?: di)?|la voce che hai (?:appena )?sentito (?:è|era)(?: di)?)\s+(\w+)", t)
+        if m:
+            name = self._name_from(m.group(1))
+            if name and vid is not None:
+                msg = self._voice_ready_msg(vid)
+                if msg:
+                    return msg
+                n = vid.enroll_recent(name, include_last=False)
+                return (f"Ok, ora riconosco la voce di {name}. Più frasi mi senti dire da lui, meglio lo riconosco."
+                        if n else "Non ho sentito abbastanza di quella voce. Fallo parlare ancora un po' e ripeti il nome.")
+        # presentazione di chi sta parlando: "sono io, Andrea"
+        m = re.match(r"^(?:sono io|sto parlando io)[, ]+(?:sono |mi chiamo )?(\w+)", t)
+        if m and vid is not None:
+            name = self._name_from(m.group(1))
+            if name:
+                msg = self._voice_ready_msg(vid)
+                if msg:
+                    return msg
+                n = vid.enroll_recent(name, include_last=True)
+                return f"Piacere {name}, ora ti riconosco." if n else \
+                    f"Piacere {name}. Parlami ancora un po' così imparo la tua voce."
+        return None
+
+    def _handle_voice_pending(self, p, tl, text):
+        kind, vid = p["kind"], self._vid()
+        if kind == "voice_learning":
+            if vid is not None and vid.learning:
+                left = vid.learning["left"]
+                p["ts"] = time.time()
+                yield f"Continua pure, ne mancano {left}."
+                return
+            self.pending = None
+            yield f"Fatto, ora riconosco la voce di {p['name']}. Più mi parla, meglio la riconosco."
+            return
+        if kind == "voice_name_learn":                         # "impara la mia voce" senza nome
+            self.pending = None
+            name = self._name_from(text)
+            yield self._start_voice_learning(vid, name) if (name and vid is not None) else "Non ho capito il nome."
+            return
+        # voice_name: ho chiesto a una voce sconosciuta come si chiama
+        self.pending = None
+        if re.match(r"^(?:no|niente|non importa|lascia stare|nessuno|non serve)\b", tl):
+            self._voice_ask_until = time.time() + 3600
+            yield "Va bene, non te lo chiedo più per un po'."
+            return
+        name = self._name_from(re.sub(r"^(?:sono|mi chiamo|io sono|io mi chiamo)\s+", "", tl))
+        if not name or vid is None:
+            yield "Non ho capito il nome."
+            return
+        n = vid.enroll_recent(name, include_last=True)
+        yield (f"Piacere {name}, ora ti riconosco." if n else
+               f"Piacere {name}. Parlami ancora un po' così imparo la tua voce.")
+
+    def _maybe_ask_name(self):
+        """Voce sconosciuta (e un proprietario esiste): una volta ogni tanto chiede come si chiama."""
+        vid, sp = self._vid(), self.current_speaker
+        if (vid is None or not vid.owner or not vid.ready or not sp or sp.get("known") or sp.get("short")
+                or self.pending or time.time() < self._voice_ask_until):
+            return ""
+        self._voice_ask_until = time.time() + 900
+        self.pending = {"kind": "voice_name", "ts": time.time(), "ttl": 60}
+        return "Scusa, non conosco la tua voce: come ti chiami?"
+
+    def _start_voice_learning(self, vid, name: str):
+        vid.start_learning(name, 4)
+        self.pending = {"kind": "voice_learning", "name": name, "ts": time.time(), "ttl": 120}
+        who = "ti" if (self.current_speaker or {}).get("name") == name else "lo"
+        return (f"Va bene. Parla normalmente per qualche frase: {who} ascolto e imparo la voce di {name}. "
+                "Ne bastano quattro, ognuna di almeno un paio di secondi.")
+
+    def _speaker_line(self) -> str:
+        sp, vid = self.current_speaker, self._vid()
+        if not sp or vid is None or not vid.names():
+            return ""
+        if sp.get("name"):
+            return f"Ti sta parlando {sp['name']}" + (" (il tuo proprietario)." if sp["name"] == vid.owner else ".") + "\n"
+        return "Ti sta parlando una persona che non riconosci: non è il proprietario.\n"
 
     def _persona_prompt(self) -> str:
         now = datetime.datetime.now().strftime("%d/%m/%Y alle ore %H:%M")
@@ -205,6 +502,7 @@ class LocalBrain:
         return (
             "Sei J.A.R.V.I.S., l'assistente personale dell'utente: sveglio, caloroso e con un filo di ironia garbata, "
             "come un amico fidato che ha sempre la battuta giusta ma sa quando essere serio.\n"
+            + self._speaker_line() +
             "COME PARLI:\n"
             "- Dai del tu, in italiano naturale e colloquiale, come in una vera conversazione a voce. Mai il lei, mai 'Signore'.\n"
             "- Frasi brevi (di solito 2-4), niente elenchi, niente markdown, niente emoji: le tue parole vengono lette ad alta voce.\n"
@@ -213,6 +511,8 @@ class LocalBrain:
             "una breve domanda di rimando.\n"
             "- Mai freddo o burocratico: evita formule come 'Come posso aiutarti?' o 'Sono a tua disposizione' a ogni risposta.\n"
             "- Se non sai una cosa, dillo con onestà invece di inventarla.\n"
+            "- Non dire mai di aver creato, installato o elencato moduli: lo fanno solo i comandi \"crea un modulo\" e \"lista moduli\". "
+            "Se l'utente ne parla, spiegagli di usare quei comandi.\n"
             "- Non parlare di moduli, strumenti o funzioni interne a meno che l'utente non te lo chieda.\n"
             f"Data e ora: {now}.\n"
             "Cosa sai dell'utente (usalo solo quando è pertinente, senza elencarlo):\n"
@@ -248,25 +548,32 @@ class LocalBrain:
         self._tags_cache = (time.time(), names)
         return names
 
+    @staticmethod
+    def _check(res):
+        """raise_for_status, ma con il motivo scritto da Ollama (es. 'memoria insufficiente') al posto del solo '500'."""
+        if res.status_code >= 400:
+            try:
+                why = res.json().get("error", "")
+            except Exception:
+                why = (res.text or "")[:200]
+            raise RuntimeError(f"Ollama {res.status_code}: {why or res.reason}")
+
     def _coder_ready(self) -> bool:
-        """True se il modello grande è installato (se non riesco a verificarlo, ci provo comunque)."""
-        names = self._installed_models()
-        if not names:
-            return True
-        c = self.coder_model
-        return any(n == c or n.startswith(c + ":") for n in names)
+        """True se il modello grande è installato e non ha dato errori da poco (se non riesco a verificarlo, ci provo)."""
+        return self.coder_model != self.model_name
 
     def _stream_chat(self, messages, options=None, model=None):
         model = model or self.model_name
-        big = model == self.coder_model and model != self.model_name
+        big = self._is_big(model)
         self.last_model = model
+        self._emit("model", model)
         payload = {
             "model": model, "messages": messages, "stream": True,
             "keep_alive": CODER_KEEP_ALIVE if big else "30m",
             "options": options or {"temperature": 0.65, "top_p": 0.9, "num_predict": 350},
         }
         with self.session.post(self.url, json=payload, stream=True, timeout=(5, 300 if big else 120)) as res:
-            res.raise_for_status()
+            self._check(res)
             for line in res.iter_lines():
                 if not line:
                     continue
@@ -279,8 +586,9 @@ class LocalBrain:
 
     def _llm_json(self, system: str, user: str, max_tokens: int = 300, temperature: float = 0.3, model=None):
         model = model or self.model_name
-        big = model == self.coder_model and model != self.model_name
+        big = self._is_big(model)
         self.last_model = model
+        self._emit("model", model)
         payload = {
             "model": model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -288,7 +596,7 @@ class LocalBrain:
             "options": {"temperature": temperature, "num_predict": max_tokens},
         }
         res = self.session.post(self.url, json=payload, timeout=600 if big else 90)
-        res.raise_for_status()
+        self._check(res)
         return self._parse_intent(res.json().get("message", {}).get("content", ""))
 
     @staticmethod
@@ -304,10 +612,12 @@ class LocalBrain:
         return data if isinstance(data, dict) else None
 
     def _remember(self, fact: str) -> str:
+        self._emit("service", "memory")
         self._skip_extract = True
         return "Annotato." if self.memory.add_fact(fact) else "Lo sapevo già."
 
     def _forget(self, query: str) -> str:
+        self._emit("service", "memory")
         self._skip_extract = True
         if re.fullmatch(r"(?:tutto|tutto quanto|tutto quello che sai)", query.lower().strip(" .!?")):
             return "Per azzerare la memoria elimini il file memory.json nella cartella data. Non lo faccio di mia iniziativa."
@@ -317,6 +627,7 @@ class LocalBrain:
         return f"Dimenticato: {'; '.join(removed)}." if removed else "Non ho trovato nulla del genere."
 
     def _list_memory(self) -> str:
+        self._emit("service", "memory")
         self._skip_extract = True
         facts = self.memory.facts()
         if not facts:
@@ -378,18 +689,37 @@ class LocalBrain:
             if verb in ("sgancia", "disattiva"):
                 return self.tools.unload_module(key)
             return self.tools.reload_module(key)
-        if re.search(r"\b(?:quali|elenco|stato)\b.*\bmoduli\b|\bmoduli (?:caricati|attivi|disponibili)\b", t):
-            return self._speakable(self.tools.get_modules_status())
-        m = re.match(r"^(?:crea|creami|genera|scrivi|costruisci|fammi|fai)(?:mi)?\s+(?:un|uno|una|il)?\s*"
-                     r"(?:nuovo\s+|nuova\s+)?(?:modulo|strumento|tool)\b", t)
+        if re.search(r"\bmodelli\b.*\b(?:ollama|installat\w+|disponibil\w+|hai|usi|ho)\b|\b(?:elenco|lista)\b.*\bmodelli\b", t):
+            return self.registry.report()
+        if re.search(r"\b(?:quali|elenco|lista)\b.*\baccount\b", t):
+            accs = self.accounts.data["accounts"]
+            act = self.accounts.active()
+            return ("Account di posta: " + "; ".join(f"{a['label']}, {a['address']}" for a in accs) +
+                    f". Attivo: {act['label']}." if accs else "Non c'è nessun account di posta. Aggiungilo da Impostazioni.")
+        m = re.search(r"\b(?:usa|passa|cambia|attiva|metti)\b.*\baccount\b(.*)$", t)
         if m:
-            return self._create_module(clean)
+            acc = self.accounts.find(m.group(1))
+            if not acc:
+                return "Non trovo quell'account. Dì: quali account hai."
+            self.accounts.set_active(acc["label"])
+            ok = self.reload_mail()
+            return f"Ora uso l'account {acc['label']}." if ok else \
+                f"Ho scelto l'account {acc['label']}, ma non è configurato bene: controlla Impostazioni."
+        if re.search(r"\bmoduli\b|\bquali (?:strumenti|plugin)\b", t) and not re.search(
+                r"\b(?:crea\w*|creare|crei|genera\w*|scrivi\w*|costruisc\w+|svilupp\w+|fammi|fai|aggiungi\w*|impara)\b", t):
+            return self._modules_report()
+        m = re.search(r"\b(?:crea\w*|creare|crei|genera\w*|scrivi\w*|costruisc\w+|costruire|svilupp\w+|"
+                      r"fa(?:i|mmi|re)|aggiungi\w*|programma\w*|implementa\w*)\b[^.!?]{0,40}?"
+                      r"\b(?:modulo|moduli|strumento|plugin|tool)\b", t)
+        if m and not re.search(r"\b(?:elenco|quali|stato|mostra\w*|attiva|sgancia|disattiva|ricarica)\b", t[:m.start() + 12]):
+            logging.info("[MODULI] richiesta di creazione: %s", clean)
+            return self._create_module(re.sub(r"^(?:jarvis|ehi jarvis)[, ]+", "", clean, flags=re.I))
 
         # autoaggiornamento e compiti complessi -> modello grande
         if SELF_IMPROVE_RE.match(clean):
             return self._create_module(clean)
         if CODE_RE.search(t):
-            return self._deep_answer(clean)
+            return self._deep_answer(clean, "code")
 
         # memoria
         m = re.match(r"^(?:ricorda(?:ti)?|memorizza|annota)\b(?:\s+che)?\s+(.{4,})$", clean, re.I)
@@ -568,6 +898,7 @@ class LocalBrain:
             return []
 
     def _web_answer(self, question: str, query: str, ack: str):
+        self._emit("service", "web")
         if not query or len(query) <= 2:
             return
         if DDGS is None:
@@ -597,7 +928,9 @@ class LocalBrain:
 
     @staticmethod
     def _mail_off() -> str:
-        return "La posta non è configurata. Imposti MAIL_ADDRESS e MAIL_PASSWORD."
+        why = env_problem()
+        return ("La posta non è configurata: " + why + "." if why
+                else "La posta non è configurata. Controlla indirizzo, password e provider nel file punto env.")
 
     def _set_last_mail(self, m):
         self.last_mail = m
@@ -625,6 +958,7 @@ class LocalBrain:
             self.on_mail_alert(text)
 
     def _check_mail(self):
+        self._emit("service", "mail")
         self._raw_reply = "[Elenco email letto all'utente]"
         if not self._mail_ready():
             yield self._mail_off()
@@ -663,6 +997,7 @@ class LocalBrain:
         return self.last_mail
 
     def _read_mail(self, target, question):
+        self._emit("service", "mail")
         self._raw_reply = "[Email letta all'utente]"
         if not self._mail_ready():
             yield self._mail_off()
@@ -736,6 +1071,7 @@ class LocalBrain:
 
     # ---------------- posta: dettatura e invio ----------------
     def _compose_email(self, question, target):
+        self._emit("service", "mail")
         self._raw_reply = None
         if not self._mail_ready():
             yield self._mail_off()
@@ -839,6 +1175,11 @@ class LocalBrain:
         kind = p["kind"]
 
         if CANCEL_RE.search(tl):
+            if kind in ("voice_learning", "voice_name_learn", "voice_name"):
+                vid = self._vid()
+                if vid is not None:
+                    vid.learning = None
+                self._voice_ask_until = time.time() + 3600
             if kind == "module_confirm":
                 try:
                     os.remove(p["path"])
@@ -848,9 +1189,14 @@ class LocalBrain:
             yield "Annullato."
             return True
 
+        if kind in ("voice_learning", "voice_name_learn", "voice_name"):
+            yield from self._handle_voice_pending(p, tl, text)
+            return True
+
         if kind == "action_confirm":
             self.pending = None                              # una conferma vale una volta sola e per pochi secondi
             if CONFIRM_RE.match(tl):
+                self._emit("tool", self._module_key(p["fn"]))
                 res, error = self._run_guarded(p["fn"], p["args"], 25.0)
                 if error:
                     yield f"Non ci sono riuscito: {error}"
@@ -863,7 +1209,9 @@ class LocalBrain:
             return False                                     # altra richiesta: la conferma scade, la nuova frase prosegue
 
         if kind == "module_confirm":
-            if INSTALL_RE.match(tl):
+            # "installa", "sì installalo", "installa il modulo", "ok attivalo"... (frase breve, senza negazioni)
+            short = len(tl.split()) <= 8 and not INSTALL_NO_RE.search(tl)
+            if INSTALL_RE.match(tl) or (short and (INSTALL_WORD_RE.search(tl) or tl in ("sì", "si", "ok", "va bene", "certo"))):
                 yield from self._install_module(p)
                 return True
             return False
@@ -961,6 +1309,7 @@ class LocalBrain:
         if phrase:
             yield from self._ask_confirm(fn, args, phrase)
             return
+        self._emit("tool", self._module_key(fn))
         res, error = self._run_guarded(fn, args, 20.0)
         if isinstance(error, TimeoutError):
             yield "Ci sta mettendo troppo, lascio perdere."
@@ -974,6 +1323,7 @@ class LocalBrain:
         fn = getattr(self.tools, name, None)
         if fn is None:
             return f"Non ho il modulo che serve per questo (manca '{name}')."
+        self._emit("tool", self._module_key(fn))
         try:
             return str(fn(*args))
         except Exception as e:
@@ -1053,6 +1403,7 @@ class LocalBrain:
         if phrase:
             yield from self._ask_confirm(fn, bound, phrase)
             return
+        self._emit("tool", self._module_key(fn))
         res, error = self._run_guarded(fn, bound)
         if isinstance(error, TimeoutError):
             yield "Lo strumento ci sta mettendo troppo: lo lascio perdere."
@@ -1063,50 +1414,175 @@ class LocalBrain:
             yield out[:400] if out else "Fatto."
 
     # ---------------- creazione guidata di moduli (solo su richiesta, con conferma) ----------------
+    def _custom_tool_candidates(self, text: str) -> list:
+        """Strumenti dei moduli creati/installati dall'utente che c'entrano con la frase (parole in comune)."""
+        manager = getattr(self.tools, "manager", None)
+        if manager is None:
+            return []
+        keys = {k for k, (path, _) in manager.module_registry.items()
+                if str(path).startswith("file:") and k in manager.loaded_modules}
+        if not keys:
+            return []
+        words = {w[:5] for w in re.findall(r"\w+", text.lower()) if len(w) > 3}
+        out = []
+        for it in self.tools.catalog():
+            if it["module"] not in keys:
+                continue
+            hay = f"{it['module']} {it['name']} {it['doc']}".lower().replace("_", " ")
+            if words & {w[:5] for w in re.findall(r"\w+", hay) if len(w) > 3}:
+                out.append(it)
+        return out
+
+    def _try_custom_tool(self, text: str):
+        """Se la richiesta riguarda un modulo creato da Jarvis, lo usa con una scelta guidata (affidabile anche per un modello piccolo)."""
+        cands = self._custom_tool_candidates(text)
+        if not cands:
+            return False
+        lines = [f"- {c['module']}.{c['name']}({', '.join(c['params'])}): {c['doc']}" for c in cands[:12]]
+        system = ("Scegli lo strumento giusto per la richiesta dell'utente, oppure null se nessuno è adatto.\n"
+                  "Strumenti:\n" + "\n".join(lines) + "\n"
+                  'Rispondi SOLO con JSON: {"tool": "modulo.metodo" oppure null, "args": [valori nell\'ordine dei parametri]}')
+        try:
+            choice = self._llm_json(system, text, 150, 0.0) or {}
+        except Exception as e:
+            logging.warning("[MODULI] scelta strumento non riuscita: %s", e)
+            return False
+        tool, args = choice.get("tool"), choice.get("args")
+        if not tool or str(tool).lower() == "null":
+            return False
+        if not isinstance(args, list):
+            args = [] if args is None else [args]
+        logging.info("[MODULI] uso %s con %s", tool, args)
+        self._raw_reply = json.dumps({"action": "call_tool", "target": tool, "args": args}, ensure_ascii=False)
+        return self._call_tool(tool, args)
+
     def _tools_dir(self) -> str:
         return TOOLS_DIR                     # cartella "moduli" accanto a Jarvis.exe: resta anche dopo la chiusura
 
-    def _pick_big_model(self):
-        """(modello, avviso): il modello grande se installato, altrimenti quello normale con un avviso."""
-        if self.coder_model and self._coder_ready():
-            return self.coder_model, ""
-        return self.model_name, f"Il modello {self.coder_model} non risulta installato, uso quello normale."
+    MATH_RE = re.compile(r"\b(?:calcol\w+|equazion\w+|integral\w+|derivat\w+|dimostra\w*|logica|probabilit\w+|"
+                         r"problema di|teorema|statistic\w+|ragiona\w*|analizza\w*|confronta\w*|pro e contro)\b", re.I)
 
-    def _deep_answer(self, question: str):
-        """Compito complesso: lo affronta il modello grande, rispondendo comunque a voce e in modo sintetico."""
-        model, warn = self._pick_big_model()
-        yield warn or "Mi serve un attimo di ragionamento in più, carico il modello più potente."
+    def _task_of(self, text: str) -> str:
+        """Che tipo di compito difficile è: codice, ragionamento o altro."""
+        if CODE_RE.search(text.lower()):
+            return "code"
+        return "reasoning" if self.MATH_RE.search(text) else "complex"
+
+    def _pick_big_model(self, task: str = "complex"):
+        """(modello, avviso): il modello più adatto al compito; se non ce n'è uno adatto usa quello della chat."""
+        model = self.registry.pick(task)
+        if model == self.model_name:
+            return model, "Non ho un modello più potente acceso, uso quello normale. Puoi aggiungerne in Impostazioni."
+        return model, ""
+
+    def _deep_answer(self, question: str, task: str = ""):
+        """Compito complesso: lo affronta il modello più adatto, rispondendo comunque a voce e in modo sintetico."""
+        model, warn = self._pick_big_model(task or self._task_of(question))
+        self._emit("model", model)
+        yield warn or f"Mi serve un attimo di ragionamento in più, uso {model.split(':')[0]}."
         system = (self._persona_prompt() +
                   "Questo è un compito tecnico o complesso: ragiona con cura ma rispondi a voce in modo chiaro e sintetico "
                   "(massimo 6 frasi), spiegando a parole. Non scrivere blocchi di codice a meno che l'utente non li chieda "
                   "esplicitamente; se serve uno strumento riutilizzabile, proponi di creare un modulo.\n")
         messages = [{"role": "system", "content": system}] + self.history[-self.MAX_HISTORY:]
         messages.append({"role": "user", "content": question})
-        yield from _sentences(self._stream_chat(messages, {"temperature": 0.3, "num_predict": 700}, model=model))
+        try:
+            yield from _sentences(self._stream_chat(messages, {"temperature": 0.3, "num_predict": 700}, model=model))
+        except Exception as e:
+            if model == self.model_name:
+                raise
+            logging.warning("[MODELLO] %s ha dato errore: %s", model, e)
+            self.registry.mark_bad(model, 600)
+            alt = self.registry.pick(task or self._task_of(question), exclude=(model,))
+            if alt != model and alt != self.model_name:
+                yield f"{model.split(':')[0]} non parte, provo con {alt.split(':')[0]}."
+                try:
+                    yield from _sentences(self._stream_chat(messages, {"temperature": 0.3, "num_predict": 700}, model=alt))
+                    return
+                except Exception as e2:
+                    logging.warning("[MODELLO] %s ha dato errore: %s", alt, e2)
+                    self.registry.mark_bad(alt, 600)
+            yield "Il modello grande non parte, rispondo con quello normale."
+            yield from _sentences(self._stream_chat(messages, {"temperature": 0.3, "num_predict": 700}, model=self.model_name))
+
+    def _modules_report(self) -> str:
+        """Elenco reale dei moduli (mai inventato dal modello): collegati, spenti, con errore, in attesa."""
+        snap = self.neural_snapshot()
+        mods = snap.get("modules", [])
+        on = [m["key"] for m in mods if m["state"] == "connected"]
+        off = [m["key"] for m in mods if m["state"] == "disabled" and not m.get("error")]
+        bad = [m["key"] for m in mods if m.get("error") and m["state"] != "connected"]
+        wait = [m["key"] for m in mods if m["state"] == "pending"]
+        parts = [f"Moduli collegati, {len(on)}: " + ", ".join(on) + "." if on else "Nessun modulo collegato."]
+        if off:
+            parts.append("Disattivati in config punto json: " + ", ".join(off) + ".")
+        if bad:
+            parts.append("Con errore, non si caricano: " + ", ".join(bad) + ". Il motivo è nel file logs jarvis punto log.")
+        if wait:
+            parts.append("In attesa che tu dica installa: " + ", ".join(wait) + ".")
+        return " ".join(parts)
+
+    def _llm_text(self, system: str, user: str, max_tokens: int, temperature: float, model: str) -> str:
+        """Risposta libera (senza vincolo JSON): per il codice è molto più affidabile."""
+        big = self._is_big(model)
+        self.last_model = model
+        self._emit("model", model)
+        payload = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                   "stream": False, "keep_alive": CODER_KEEP_ALIVE if big else "30m",
+                   "options": {"temperature": temperature, "num_predict": max_tokens}}
+        res = self.session.post(self.url, json=payload, timeout=900 if big else 120)
+        self._check(res)
+        return res.json().get("message", {}).get("content", "")
 
     def _create_module(self, description: str):
         self._raw_reply = "[Creazione modulo]"
-        model, warn = self._pick_big_model()
-        yield warn or "Ok, ci provo: scrivo il modulo con il modello più potente e lo controllo. Ci vorrà un po'."
+        model, warn = self._pick_big_model("code")
+        yield warn or f"Ok, ci provo: scrivo il modulo con {model.split(':')[0]} e lo controllo. Ci vorrà un po'."
         existing = self._tools_info()
         request = f"Richiesta dell'utente: {description}"
         if existing:
             request += "\n\nStrumenti GIÀ presenti (non duplicarli, aggiungi solo ciò che manca):" + existing
-        try:
-            data = self._llm_json(build_module_prompt(), request, 1800, 0.2, model=model)
-        except Exception as e:
-            yield f"Non riesco a contattare il modello: {e}"
-            return
-        data = data or {}
-        name = sanitize_module_name(str(data.get("module_name", "")))
-        code = str(data.get("python_code", ""))
-        if not name or not code.strip():
-            yield "Il modello non ha prodotto un modulo utilizzabile. Riprova descrivendomelo in modo più preciso."
-            return
-        errors, info = validate_code(code)
-        if errors:
-            print(f"[MODULE BUILDER] codice scartato: {errors}")
-            yield f"Ho scartato il codice per sicurezza: {errors[0]}. Riprova con una richiesta più semplice."
+        name = code = info = None
+        problem, feedback = "", ""
+        for round_no in (1, 2):                                   # al secondo giro il modello vede l'errore del primo
+            raw = None
+            for attempt in (model, self.model_name):
+                try:
+                    raw = self._llm_text(build_module_prompt(), request + feedback, 3000, 0.2, attempt)
+                    model = attempt
+                    break
+                except Exception as e:
+                    logging.warning("[MODULI] il modello %s ha dato errore: %s", attempt, e)
+                    if attempt != self.model_name:                # il grande non parte (memoria?): ripiega sul normale
+                        self.registry.mark_bad(attempt, 600)
+                        yield (f"Il modello grande non parte: {str(e)[:140]}. Provo con quello normale, "
+                               "il modulo sarà più semplice.")
+                        continue
+                    yield f"Non riesco a contattare il modello: {str(e)[:160]}"
+                    return
+            name, code = parse_module_reply(raw)
+            name = sanitize_module_name(name)
+            if not name or not code.strip():
+                logging.warning("[MODULI] risposta del modello non utilizzabile. Inizio risposta: %r", (raw or "")[:400])
+                problem, feedback = "risposta senza codice", ""
+                continue
+            errors, info = validate_code(code)
+            if errors:
+                logging.warning("[MODULI] codice scartato (giro %s): %s", round_no, errors)
+                problem = errors[0]
+                feedback = f"\n\nIl tuo codice precedente è stato rifiutato: {problem}. Correggilo.\n```python\n{code}\n```"
+                continue
+            code = prepare_code(code)
+            err = smoke_test(code, info["class_name"])
+            if err:
+                logging.warning("[MODULI] prova di importazione fallita (giro %s): %s", round_no, err)
+                problem = f"in prova dava l'errore {err}"
+                feedback = f"\n\nIl tuo codice precedente in prova dava questo errore: {err}. Correggilo.\n```python\n{code}\n```"
+                continue
+            problem = ""
+            break
+        if problem:
+            yield f"Non sono riuscito a farne uno che funziona: {problem[:160]}. Riprova descrivendomelo in modo più semplice."
             return
         tools_dir, base_name, i = self._tools_dir(), name, 2
         registry = getattr(getattr(self.tools, "manager", None), "module_registry", {})
@@ -1117,11 +1593,12 @@ class LocalBrain:
         os.makedirs(pending_dir, exist_ok=True)
         path = os.path.join(pending_dir, f"{name}_tools.py")
         with open(path, "w", encoding="utf-8") as f:
-            f.write(code.strip() + "\n")
+            f.write(code)
         self.pending = {"kind": "module_confirm", "name": name, "path": path,
                         "methods": info["methods"], "ts": time.time()}
         yield f"Fatto: il modulo {name} ha queste funzioni: {', '.join(info['methods'])}."
-        yield "Il codice è nella cartella _pending dei tools, se vuoi dargli un'occhiata. Dì installa per attivarlo, oppure annulla."
+        logging.info("[MODULI] creato %s (%s) in %s", name, ", ".join(info["methods"]), path)
+        yield "Il codice è nella cartella moduli, sotto _pending, se vuoi dargli un'occhiata. Dì installa per attivarlo, oppure annulla."
 
     def _install_module(self, p):
         name, src = p["name"], p["path"]
@@ -1136,10 +1613,14 @@ class LocalBrain:
             return
         self.pending = None
         msg = self.tools.load_module(name)
+        logging.info("[MODULI] installazione %s: %s", name, msg)
         if name in getattr(self.tools.manager, "loaded_modules", {}):
             yield f"Installato e attivo. Puoi chiedermi di usarlo: {', '.join(p['methods'])}."
         else:
-            yield f"L'ho salvato ma non si è attivato: {msg}"
+            logging.warning("[MODULI] %s non attivato: %s", name, msg)
+            why = (getattr(self.tools.manager, "load_errors", {}).get(name) or msg or "").strip()
+            yield ("L'ho salvato nella cartella moduli ma non si è attivato. "
+                   + (f"Il motivo: {why[:180]}. " if why else "") + "I dettagli sono nel file logs jarvis punto log.")
 
     # ---------------- azioni ----------------
     def _execute(self, intent: dict, question: str):
@@ -1192,7 +1673,7 @@ class LocalBrain:
         elif action == "create_module":
             yield from self._create_module(str(target or question))
         elif action == "complex":
-            yield from self._deep_answer(str(target or question))
+            yield from self._deep_answer(str(target or question), self._task_of(str(target or question)))
         elif reply:
             yield reply                              # il modello ha risposto a voce dentro un JSON
         else:
@@ -1211,12 +1692,26 @@ class LocalBrain:
             if consumed:
                 return
 
+        blocked = self._guest_gate(text)
+        if blocked:
+            yield blocked
+            return
+        vc = self._voice_commands(text.lower().strip(" .!?,"), text.strip(" ."))
+        if vc is not None:
+            yield vc
+            return
+
         fast = self._fast_path(text)
         if fast is not None:
             if isinstance(fast, str):
                 yield fast
             else:
                 yield from fast
+            return
+
+        custom = self._try_custom_tool(text)
+        if custom:
+            yield from custom
             return
 
         messages = [{"role": "system", "content": self._router_prompt()}]
@@ -1256,6 +1751,7 @@ class LocalBrain:
         self._skip_extract = False
         had_pending = bool(self.pending)
         parts = []
+        self._emit("think", "")
         try:
             for sentence in self._route(text):
                 if sentence:
@@ -1267,16 +1763,23 @@ class LocalBrain:
         except Exception as e:
             yield f"Ho avuto un problema: {e}"
             return
+        finally:
+            self._emit("done", "")
 
         full = " ".join(parts).strip()
         if not full:
             return
+        ask = self._maybe_ask_name()
+        if ask:
+            yield ask
+            full += " " + ask
         self.history.append({"role": "user", "content": text})
         self.history.append({"role": "assistant", "content": self._raw_reply or full})
         self.history = self.history[-self.MAX_HISTORY:]
 
         dictating = had_pending or bool(self.pending)      # testo dettato per email/moduli: non è un fatto su di lui
-        if MEMORY_TRIGGERS.search(text) and not self._skip_extract and not dictating:
+        guest = self._is_guest()                           # i fatti detti da un'altra voce non finiscono nella tua memoria
+        if MEMORY_TRIGGERS.search(text) and not self._skip_extract and not dictating and not guest:
             threading.Thread(target=self._auto_extract_facts, args=(text,), daemon=True).start()
 
     def process_input(self, user_msg: str) -> str:

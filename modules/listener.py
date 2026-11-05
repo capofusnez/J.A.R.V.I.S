@@ -38,6 +38,13 @@ class Listener:
         self.recognizer = sr.Recognizer()
         self._ready = False
         self._init_lock = threading.Lock()
+        self.last_speaker = None          # chi ha parlato nell'ultima frase: {"name","score","known"} (None = non disponibile)
+        try:
+            from modules.voiceid import get_voiceid
+            self.voiceid = get_voiceid()
+        except Exception as e:           # senza numpy/onnxruntime Jarvis funziona lo stesso, solo senza riconoscere le voci
+            print(f"[LISTENER WARNING] riconoscimento voce non disponibile: {e}")
+            self.voiceid = None
 
     # ---------------- preparazione ----------------
     def warmup(self):
@@ -59,6 +66,8 @@ class Listener:
                     print(f"[LISTENER WARNING] Whisper non caricato, uso Google: {e}")
                     self.model = None
             self._ready = True
+        if self.voiceid is not None:      # scarica una volta sola il modello delle voci (circa 26 MB), poi è offline
+            threading.Thread(target=self.voiceid.prepare, daemon=True).start()
 
     def _load_model(self, force_cpu=False):
         if not force_cpu:
@@ -87,7 +96,8 @@ class Listener:
             pass
 
     # ---------------- registrazione ----------------
-    def _record_phrase(self):
+    def _record_phrase(self, start_timeout=None):
+        start_timeout = self.start_timeout if start_timeout is None else start_timeout
         preroll = collections.deque(maxlen=int(0.3 / self.block_s))
         frames, speaking = [], False
         silent_blocks, waited = 0, 0.0
@@ -109,7 +119,7 @@ class Listener:
                         frames.extend(preroll)
                     else:
                         waited += self.block_s
-                        if waited >= self.start_timeout:
+                        if waited >= start_timeout:
                             return None
                 else:
                     frames.append(chunk.copy())
@@ -151,17 +161,27 @@ class Listener:
         except sr.UnknownValueError:
             return ""
 
-    def listen(self, duration=None) -> str:
-        """`duration` è ignorato: resta solo per compatibilità con il vecchio codice."""
+    def listen(self, duration=None, start_timeout=None) -> str:
+        """`duration` è ignorato (compatibilità). `start_timeout`: secondi di attesa prima che inizi a parlare."""
         try:
             self._ensure_ready()
-            samples = self._record_phrase()
+            samples = self._record_phrase(start_timeout)
             self.level = 0.0
             if samples is None or len(samples) < self.samplerate * 0.4:
                 return ""
             text = self._transcribe(samples).strip()
             if "sottotitoli" in text.lower():     # allucinazione tipica di Whisper
                 return ""
+            self.last_speaker = None
+            vid = self.voiceid
+            if text and vid is not None and vid.ready:
+                try:
+                    who = vid.observe(samples)     # chi è? impara da solo se la voce è già nota
+                    self.last_speaker = who
+                    if vid.only_owner and vid.owner and who.get("name") != vid.owner:
+                        return ""                  # "rispondi solo a me": le altre voci vengono ignorate
+                except Exception as e:
+                    print(f"[LISTENER WARNING] voce: {e}")
             return text
         except Exception as e:
             print(f"[LISTENER ERROR] {e}")

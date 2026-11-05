@@ -13,13 +13,12 @@ from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import parseaddr, formataddr, formatdate, make_msgid, getaddresses, parsedate_to_datetime
 
-try:                                  # opzionale: legge MAIL_* da un file .env
-    from dotenv import load_dotenv
-    from modules.paths import ENV_PATH
-    load_dotenv(ENV_PATH)             # il .env sta accanto a Jarvis.exe (o a main.py)
-    load_dotenv()                     # ripiego: cartella corrente
-except Exception:
-    pass
+try:                              # legge MAIL_* dal file .env accanto a Jarvis.exe (o a main.py)
+    from modules.paths import load_env
+    load_env()
+except Exception as _e:               # non nascondere l'errore: finisce in logs/jarvis.log
+    import logging
+    logging.warning("[POSTA] lettura del file .env non riuscita: %s", _e)
 
 # dominio -> (host IMAP, host SMTP, porta SMTP)
 PRESETS = {
@@ -161,6 +160,8 @@ class MailConfig:
         pwd = os.environ.get("MAIL_PASSWORD", "").strip()
         if not addr or not pwd:
             return None
+        if addr.split("@")[-1].lower() in ("gmail.com", "googlemail.com"):
+            pwd = re.sub(r"\s+", "", pwd)       # Google la mostra a gruppi di 4 con spazi: senza spazi funziona sempre
         imap_h, smtp_h, smtp_p = PRESETS.get(addr.split("@")[-1].lower(), (None, None, 465))
         imap_h = os.environ.get("MAIL_IMAP_HOST", imap_h or "")
         smtp_h = os.environ.get("MAIL_SMTP_HOST", smtp_h or "")
