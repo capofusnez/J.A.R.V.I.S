@@ -15,10 +15,6 @@ interfaccia HUD con mappa neurale. Tutto gira in locale; i dati restano accanto 
 - [Moduli creati da Jarvis](#moduli-creati-da-jarvis)
 - [Impostazioni](#impostazioni)
 - [Modelli](#modelli)
-- [Interruttori Sonoff](#interruttori-sonoff)
-- [Dove Jarvis tiene i file](#dove-jarvis-tiene-i-file)
-- [Compilare l'exe](#compilare-lexe)
-- [Aggiornamenti OTA da GitHub](#aggiornamenti-ota-da-github)
 - [Risoluzione problemi](#risoluzione-problemi)
 
 ## Avvio
@@ -144,45 +140,6 @@ Jarvis lo dice, usa il modello normale e riprova dopo 10 minuti. Per uno più le
 e `JARVIS_CODER_MODEL=qwen2.5-coder:7b`. Predefiniti: `qwen2.5` (`JARVIS_MODEL`) e `qwen2.5-coder:14b`
 (`JARVIS_CODER_MODEL`), caricato solo quando serve.
 
-## Interruttori Sonoff
-
-`python scansonoff.py` (PC nella stessa rete delle placche) elenca quelle comandabili in locale e scrive
-`scansonoff_risultato.txt`.
-
-## Dove Jarvis tiene i file
-
-Tutto accanto a `main.py` / `Jarvis.exe`:
-
-```
-.env          password della posta (lo scrivi tu)
-config.json   moduli attivi / disattivi
-data\         memoria, stato posta, voci riconosciute, account
-logs\         jarvis.log e jarvis_crash.log: se qualcosa non va, guarda qui
-voices\       voci offline scaricate
-moduli\       moduli creati da Jarvis; moduli\_pending = in attesa del tuo «installa»
-update\       aggiornamento scaricato (temporaneo)
-```
-
-Se la cartella non è scrivibile (es. `C:\Program Files`) usa `%LOCALAPPDATA%\Jarvis`.
-
-## Compilare l'exe
-
-Doppio clic su `compila.bat` → `dist\Jarvis.exe`. Se il tuo Python è altrove, correggi la riga `set PY=`.
-I dati restano fuori dall'exe: ricompilare non li cancella. Metti `.env` accanto all'exe.
-Con `icona.ico` nella cartella l'exe la usa.
-
-## Aggiornamenti OTA da GitHub
-
-Rilascio manuale:
-
-1. **Una volta sola**: in `modules/version.py` scrivi `UPDATE_REPO = "utente/repository"` (finisce dentro l'exe).
-   Per un repository privato aggiungi `GITHUB_TOKEN=...` nel `.env` accanto all'exe.
-2. **Per ogni versione**: cambia `VERSION` in `modules/version.py` (es. `"1.1.0"`), compila, crea su GitHub una
-   **Release** con tag uguale (es. `v1.1.0`) e carica `Jarvis.exe` tra gli asset.
-   Tag e `VERSION` dentro l'exe devono coincidere, altrimenti Jarvis si crede sempre indietro.
-3. Jarvis controlla all'avvio e ogni 6 ore. L'installazione (solo proprietario) scarica l'exe, verifica che sia valido
-   (e lo SHA-256 se GitHub lo fornisce), si chiude, sostituisce il file e si riavvia. Il vecchio resta come `Jarvis.exe.bak`.
-   `config.json`, `.env`, `data`, voci e moduli non vengono toccati.
 
 ## Risoluzione problemi
 
